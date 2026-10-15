@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- RasDaw app icon: clip rows in Tokyo Night track colours, a playhead and a panel bevel -->
+  <rect x="8" y="8" width="240" height="240" rx="48" fill="#1a1b26"/>
+  <rect x="8" y="8" width="240" height="240" rx="48" fill="none" stroke="#3b4261" stroke-width="6"/>
+  <rect x="40" y="52" width="176" height="14" rx="7" fill="#7aa2f7" opacity="0.35"/>
+  <rect x="40" y="52" width="96" height="14" rx="7" fill="#7aa2f7"/>
+  <rect x="40" y="84" width="176" height="14" rx="7" fill="#bb9af7" opacity="0.35"/>
+  <rect x="88" y="84" width="104" height="14" rx="7" fill="#bb9af7"/>
+  <rect x="40" y="116" width="176" height="14" rx="7" fill="#7dcfff" opacity="0.35"/>
+  <rect x="40" y="116" width="56" height="14" rx="7" fill="#7dcfff"/>
+  <rect x="120" y="116" width="72" height="14" rx="7" fill="#7dcfff"/>
+  <path d="M40 186 Q58 146 76 186 T112 186 T148 186 T184 186 T216 186" fill="none" stroke="#9ece6a" stroke-width="10" stroke-linecap="round"/>
+  <rect x="150" y="40" width="8" height="176" rx="4" fill="#ff9e64"/>
+</svg>

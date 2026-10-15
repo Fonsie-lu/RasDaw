@@ -41,8 +41,8 @@ device rack; there is no separate plugin window.
 
 ```sh
 cargo run --release [project.json]
-./install.sh              # build and install to ~/.local/bin/rasdaw
-./install.sh --uninstall  # remove it again
+./install.sh              # build; install to ~/.local/bin/rasdaw plus app launcher entry and icon
+./install.sh --uninstall  # remove all of it again
 ```
 
 - Plugins are searched in `$CLAP_PATH`, `~/.clap`, `/usr/lib/clap` and `/usr/local/lib/clap`.

@@ -32,7 +32,12 @@ fn main() -> eframe::Result {
             .with_title("RasDaw")
             .with_app_id("rasdaw")
             .with_inner_size([1600.0, 980.0])
-            .with_min_inner_size([1000.0, 640.0]),
+            .with_min_inner_size([1000.0, 640.0])
+            .with_icon(eframe::egui::IconData {
+                rgba: include_bytes!("../assets/icons/rasdaw-64.rgba").to_vec(),
+                width: 64,
+                height: 64,
+            }),
         ..Default::default()
     };
     eframe::run_native(

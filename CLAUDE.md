@@ -10,7 +10,7 @@ buttons, fader caps, ribbed knobs) with a Tokyo Night colour scheme.
 ```sh
 cargo run --release                         # app (binary `rasdaw`); project file defaults to ~/rasdaw-project.json
 cargo run --release -- path/to/project.json
-./install.sh                                # release build, copied to ~/.local/bin/rasdaw (--no-build, --uninstall, BIN_DIR=...)
+./install.sh                                # release build to ~/.local/bin/rasdaw + desktop entry + hicolor icons (--no-build, --uninstall, BIN_DIR=...)
 cargo test                                  # unit tests + real-plugin integration test
 cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one plugin editor
 ```
@@ -57,6 +57,7 @@ cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one pl
 | `src/ui/rack.rs` | Channel strip, CLAP device cards (paged knobs), shared card header, device browser |
 | `src/ui/builtin_card.rs` | Built-in device cards: all knobs at once, EQ graph with draggable band handles, gain reduction meter |
 | `src/ui/widgets.rs` | Juno-style drawing helpers, fonts, egui visuals |
+| `assets/icons/` | App icon: `rasdaw.svg` (source), PNGs 48–256 for the launcher, `rasdaw-64.rgba` (raw RGBA, window icon via `include_bytes!`). Regenerate with `magick -background none -density 384 rasdaw.svg -resize NxN rasdaw-N.png` and `magick rasdaw-64.png -depth 8 rgba:rasdaw-64.rgba` |
 | `tests/clap_host.rs` | Hosts a real instrument through the engine and checks for sound |
 | `tests/midi.rs` | A second sequencer client plays notes into RasDaw's port; checks they reach the target track |
 
