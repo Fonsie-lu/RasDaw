@@ -10,6 +10,7 @@ buttons, fader caps, ribbed knobs) with a Tokyo Night colour scheme.
 ```sh
 cargo run --release                         # app (binary `rasdaw`); project file defaults to ~/rasdaw-project.json
 cargo run --release -- path/to/project.json
+./install.sh                                # release build, copied to ~/.local/bin/rasdaw (--no-build, --uninstall, BIN_DIR=...)
 cargo test                                  # unit tests + real-plugin integration test
 cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one plugin editor
 ```

@@ -15,9 +15,6 @@ impl App {
         let cy = full.center().y;
         let mut x = full.left() + 12.0;
 
-        caption(&p, pos2(x, cy), Align2::LEFT_CENTER, "RASDAW", 15.0, t.accent);
-        x += 92.0;
-
         let playing = self.engine.shared.playing();
         let b = Rect::from_min_size(pos2(x, cy - 12.0), vec2(44.0, 24.0));
         if button(ui, b, "play", "▶", playing.then_some(t.play)).clicked() {
