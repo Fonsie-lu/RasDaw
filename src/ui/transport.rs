@@ -69,7 +69,9 @@ impl App {
             self.project.loop_enabled = loop_on;
             self.dirty = true;
         }
-        x += 70.0;
+        x += 62.0;
+        self.midi_button(ui, &p, x, cy);
+        x += 76.0;
 
         // Right side: master meter, engine info, file controls (laid out right to left).
         let mut rx = full.right() - 12.0;
@@ -110,5 +112,49 @@ impl App {
                 caption(&p, pos2(left, cy), Align2::LEFT_CENTER, &txt, 10.5, t.mute);
             }
         }
+    }
+}
+
+impl App {
+    /// MIDI button with activity LED; opens the input port list.
+    fn midi_button(&mut self, ui: &mut egui::Ui, p: &egui::Painter, x: f32, cy: f32) {
+        let t = th();
+        let b = Rect::from_min_size(pos2(x, cy - 10.0), vec2(50.0, 20.0));
+        let resp = button(ui, b, "midi", "MIDI", None).on_hover_text("MIDI keyboard inputs");
+        let lit = self
+            .view
+            .midi_flash
+            .is_some_and(|t| t.elapsed().as_millis() < 120);
+        let led = pos2(b.right() + 10.0, cy);
+        if lit {
+            p.circle_filled(led, 7.0, widgets::with_alpha(t.play, 0.2));
+        }
+        p.circle_filled(led, 4.0, if lit { t.play } else { t.bg_highlight });
+        p.circle_stroke(led, 4.0, Stroke::new(1.0_f32, egui::Color32::from_black_alpha(160)));
+
+        let id = ui.make_persistent_id("midi_popup");
+        if resp.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(id));
+        }
+        egui::popup_below_widget(ui, id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+            ui.set_min_width(300.0);
+            ui.label(egui::RichText::new("MIDI INPUTS → SELECTED TRACK").color(t.text_dim));
+            ui.separator();
+            if let Some(e) = self.midi.error() {
+                ui.colored_label(t.record, e);
+                return;
+            }
+            let ports = self.midi.ports();
+            if ports.is_empty() {
+                ui.label("No MIDI sources found. Plug in a keyboard; it connects automatically.");
+            }
+            for port in ports {
+                let mut on = port.connected;
+                let label = if port.hardware { port.name.clone() } else { format!("{} (software)", port.name) };
+                if ui.checkbox(&mut on, label).changed() {
+                    self.midi.set_connected(port.client, port.port, on);
+                }
+            }
+        });
     }
 }

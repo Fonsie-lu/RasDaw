@@ -2,7 +2,9 @@
 
 pub mod audio;
 pub mod clap_host;
+pub mod devices;
 pub mod engine;
+pub mod midi;
 pub mod model;
 pub mod theme;
 pub mod ui;

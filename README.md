@@ -1,7 +1,7 @@
 # RasDaw
 
-RasDaw by Fonsie Audio: a Bitwig-inspired DAW framework written in Rust that hosts CLAP plugins. It ships no instruments
-or effects of its own. Tokyo Night colours, with the panel style of the Alpha Juno clone.
+RasDaw by Fonsie Audio: a Bitwig-inspired DAW framework written in Rust that hosts CLAP plugins.
+It bundles a set of basic effect devices; instruments come from CLAP plugins. Tokyo Night colours, with the panel style of the Alpha Juno clone.
 
 ## Layout
 
@@ -14,6 +14,28 @@ or effects of its own. Tokyo Night colours, with the panel style of the Alpha Ju
   Esc to go back.
 - **Bottom: device rack.** Shows the selected track's channel strip and its CLAP devices, left
   to right in signal order. Use **+ ADD DEVICE** to browse the installed plugins.
+
+## Built-in devices
+
+Add them with **+ ADD DEVICE** (section "RASDAW DEVICES"). They are set up entirely in the
+device rack; there is no separate plugin window.
+
+| Device | What it does |
+|--------|--------------|
+| EQ-5 | Low shelf, 3 peaks, high shelf. Always cuts below 20 Hz and above 16 kHz and sums everything below 100 Hz to mono. Drag the numbered handles in the graph. |
+| Compressor | Threshold, ratio, attack, release, soft knee, makeup, mix; gain reduction meter |
+| Limiter | Look-ahead brickwall limiter: gain, ceiling, release; gain reduction meter |
+| Distortion | Soft, hard, fold and tube shapes with drive, tone, output and mix |
+| Delay | Free time or tempo-synced divisions, feedback, ping-pong, low/high cut in the feedback |
+| Reverb | Size, damping, width, pre-delay, low cut, mix |
+
+## MIDI keyboard
+
+- Hardware MIDI keyboards connect automatically through the ALSA sequencer, also when you
+  plug them in later.
+- The selected track receives the keyboard; its header shows a green **MIDI** badge.
+- The **MIDI** button in the transport bar lists all MIDI sources and lets you connect or
+  disconnect each one. The LED next to it flashes on incoming MIDI.
 
 ## Running
 

@@ -1,22 +1,24 @@
-//! Device rack (bottom): the selected track's channel strip, then its CLAP devices left to
-//! right in signal order, then the "+" card that opens the plugin browser.
+//! Device rack (bottom): the selected track's channel strip, then its devices (CLAP plugins
+//! and built-in devices) left to right in signal order, then the "+" card that opens the
+//! device browser. Built-in devices are drawn by `builtin_card.rs`.
 
 use super::widgets::{self, button, caption, fader, knob, meter, section_bar, with_alpha};
 use super::App;
 use crate::clap_host::PluginInstance;
-use crate::engine::volume_gain;
+use crate::devices::Kind;
+use crate::engine::{volume_gain, DeviceRef};
 use crate::theme::current as th;
 use eframe::egui::{self, pos2, vec2, Align2, Id, Rect, Sense, Stroke};
 use std::sync::Arc;
 
 const STRIP_W: f32 = 168.0;
-const CARD_W: f32 = 304.0;
+pub(super) const CARD_W: f32 = 304.0;
 const PLUS_W: f32 = 110.0;
 const COLS: usize = 4;
 /// Height a knob cell needs: knob, name and value lines.
-const CELL_H: f32 = 64.0;
+pub(super) const CELL_H: f32 = 64.0;
 
-enum RackAction {
+pub(super) enum RackAction {
     Bypass(usize),
     Editor(usize),
     Move(usize, usize),
@@ -54,10 +56,18 @@ impl App {
                         let h = devices.height() - 14.0;
                         let track = &self.project.tracks[ti];
                         let chain = self.rack.get(&track.id).cloned().unwrap_or_default();
-                        for (di, (spec, inst)) in track.devices.iter().zip(&chain).enumerate() {
-                            let (rect, _) = ui.allocate_exact_size(vec2(CARD_W, h), Sense::hover());
+                        for (di, (spec, dev)) in track.devices.iter().zip(&chain).enumerate() {
                             let n = track.devices.len();
-                            self.device_card(ui, rect, di, n, spec, inst.as_ref(), &mut actions);
+                            let w = match dev {
+                                Some(DeviceRef::Builtin(d)) => super::builtin_card::width(d.kind, h),
+                                _ => CARD_W,
+                            };
+                            let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+                            match dev {
+                                Some(DeviceRef::Builtin(d)) => self.builtin_card(ui, rect, di, n, spec, d, &mut actions),
+                                Some(DeviceRef::Clap(inst)) => self.device_card(ui, rect, di, n, spec, Some(inst), &mut actions),
+                                None => self.device_card(ui, rect, di, n, spec, None, &mut actions),
+                            }
                             let (gap, _) = ui.allocate_exact_size(vec2(18.0, h), Sense::hover());
                             caption(ui.painter(), gap.center(), Align2::CENTER_CENTER, "›", 18.0, t.text_faint);
                         }
@@ -89,7 +99,7 @@ impl App {
                     self.dirty = true;
                 }
                 RackAction::Editor(i) => {
-                    if let Some(Some(inst)) = self.rack.get(&id).and_then(|c| c.get(i)).cloned() {
+                    if let Some(Some(DeviceRef::Clap(inst))) = self.rack.get(&id).and_then(|c| c.get(i)).cloned() {
                         self.toggle_editor(&inst, &track_name);
                     }
                 }
@@ -163,11 +173,9 @@ impl App {
     ) {
         let t = th();
         let p = ui.painter().clone();
-        p.rect_filled(rect.translate(vec2(0.0, 3.0)), widgets::r(4.0), egui::Color32::from_black_alpha(120));
-        p.rect_filled(rect, widgets::r(4.0), t.bg_panel);
-        p.line_segment([rect.left_top() + vec2(4.0, 0.0), rect.right_top() - vec2(4.0, 0.0)], Stroke::new(1.0_f32, t.bevel));
-        let bar = Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(rect.width() - 8.0, 20.0));
         let Some(inst) = inst else {
+            card_body(&p, rect);
+            let bar = Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(rect.width() - 8.0, 20.0));
             section_bar(&p, bar, &format!("MISSING · {}", spec.name.to_uppercase()), t.record);
             caption(&p, rect.center(), Align2::CENTER_CENTER, &spec.plugin_id, 11.0, t.text_dim);
             let b = Rect::from_min_size(pos2(rect.right() - 30.0, bar.bottom() + 6.0), vec2(24.0, 18.0));
@@ -183,21 +191,9 @@ impl App {
         } else {
             2
         };
-        let bar_col = if spec.bypass { t.text_faint } else { t.device_bars[kind] };
-        section_bar(&p, bar, &widgets::fit_text(ui, &spec.name.to_uppercase(), 13.0, bar.width() - 10.0), bar_col);
-
-        // Button row
-        let by = bar.bottom() + 6.0;
         let uid = inst.uid;
-        let mut x = rect.left() + 6.0;
-        let b = Rect::from_min_size(pos2(x, by), vec2(36.0, 18.0));
-        if button(ui, b, ("on", uid), "ON", (!spec.bypass).then_some(t.play))
-            .on_hover_text("Bypass on/off")
-            .clicked()
-        {
-            actions.push(RackAction::Bypass(di));
-        }
-        x += 40.0;
+        let by = card_header(ui, rect, di, count, uid, spec, t.device_bars[kind], actions);
+        let x = rect.left() + 46.0;
         if inst.has_gui() {
             let b = Rect::from_min_size(pos2(x, by), vec2(44.0, 18.0));
             let open = self.editor_open(uid);
@@ -206,25 +202,6 @@ impl App {
                 .clicked()
             {
                 actions.push(RackAction::Editor(di));
-            }
-        }
-        let mut rx = rect.right() - 6.0;
-        let b = Rect::from_min_size(pos2(rx - 24.0, by), vec2(24.0, 18.0));
-        if button(ui, b, ("rm", uid), "✕", None).on_hover_text("Remove device").clicked() {
-            actions.push(RackAction::Remove(di));
-        }
-        rx -= 32.0;
-        if di + 1 < count {
-            let b = Rect::from_min_size(pos2(rx - 24.0, by), vec2(24.0, 18.0));
-            if button(ui, b, ("right", uid), "▶", None).on_hover_text("Move right").clicked() {
-                actions.push(RackAction::Move(di, di + 1));
-            }
-        }
-        rx -= 28.0;
-        if di > 0 {
-            let b = Rect::from_min_size(pos2(rx - 24.0, by), vec2(24.0, 18.0));
-            if button(ui, b, ("left", uid), "◀", None).on_hover_text("Move left").clicked() {
-                actions.push(RackAction::Move(di, di - 1));
             }
         }
 
@@ -289,7 +266,7 @@ impl App {
     pub(super) fn browser_ui(&mut self, ctx: &egui::Context) {
         let t = th();
         let mut open = true;
-        let mut chosen = None;
+        let mut chosen: Option<Result<Kind, crate::clap_host::PluginDesc>> = None;
         egui::Window::new("ADD DEVICE")
             .open(&mut open)
             .collapsible(false)
@@ -304,6 +281,19 @@ impl App {
                 ui.separator();
                 let filter = self.view.browser_filter.to_lowercase();
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    let builtins: Vec<Kind> = Kind::ALL
+                        .into_iter()
+                        .filter(|k| filter.is_empty() || k.name().to_lowercase().contains(&filter))
+                        .collect();
+                    if !builtins.is_empty() {
+                        ui.colored_label(t.device_bars[3], "RASDAW DEVICES");
+                        for k in builtins {
+                            if ui.selectable_label(false, k.name()).on_hover_text(k.description()).clicked() {
+                                chosen = Some(Ok(k));
+                            }
+                        }
+                        ui.add_space(6.0);
+                    }
                     type Filter = fn(&crate::clap_host::PluginDesc) -> bool;
                     let groups: [(&str, Filter, usize); 3] = [
                         ("INSTRUMENTS", |d| d.is_instrument(), 0),
@@ -325,7 +315,7 @@ impl App {
                         for d in list {
                             let label = format!("{}   ·  {} {}", d.name, d.vendor, d.version);
                             if ui.selectable_label(false, label).on_hover_text(d.library.path.display().to_string()).clicked() {
-                                chosen = Some(d.clone());
+                                chosen = Some(Err(d.clone()));
                             }
                         }
                         ui.add_space(6.0);
@@ -348,9 +338,12 @@ impl App {
                     }
                 });
             });
-        if let Some(desc) = chosen {
+        if let Some(choice) = chosen {
             let ti = self.view.selected_track;
-            self.add_device(ti, &desc);
+            match choice {
+                Ok(kind) => self.add_builtin(ti, kind),
+                Err(desc) => self.add_device(ti, &desc),
+            }
             open = false;
         }
         if !open {
@@ -358,4 +351,61 @@ impl App {
             self.view.browser_filter.clear();
         }
     }
+}
+
+/// Card background with drop shadow and bevel.
+pub(super) fn card_body(p: &egui::Painter, rect: Rect) {
+    let t = th();
+    p.rect_filled(rect.translate(vec2(0.0, 3.0)), widgets::r(4.0), egui::Color32::from_black_alpha(120));
+    p.rect_filled(rect, widgets::r(4.0), t.bg_panel);
+    p.line_segment([rect.left_top() + vec2(4.0, 0.0), rect.right_top() - vec2(4.0, 0.0)], Stroke::new(1.0_f32, t.bevel));
+}
+
+/// Card body, title bar and the shared button row (ON, move left/right, remove).
+/// Returns the y of the button row; x from `rect.left() + 46` is free for more buttons.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn card_header(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    di: usize,
+    count: usize,
+    uid: u64,
+    spec: &crate::model::DeviceSpec,
+    color: egui::Color32,
+    actions: &mut Vec<RackAction>,
+) -> f32 {
+    let t = th();
+    let p = ui.painter().clone();
+    card_body(&p, rect);
+    let bar = Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(rect.width() - 8.0, 20.0));
+    let bar_col = if spec.bypass { t.text_faint } else { color };
+    section_bar(&p, bar, &widgets::fit_text(ui, &spec.name.to_uppercase(), 13.0, bar.width() - 10.0), bar_col);
+    let by = bar.bottom() + 6.0;
+    let b = Rect::from_min_size(pos2(rect.left() + 6.0, by), vec2(36.0, 18.0));
+    if button(ui, b, ("on", uid), "ON", (!spec.bypass).then_some(t.play))
+        .on_hover_text("Bypass on/off")
+        .clicked()
+    {
+        actions.push(RackAction::Bypass(di));
+    }
+    let mut rx = rect.right() - 6.0;
+    let b = Rect::from_min_size(pos2(rx - 24.0, by), vec2(24.0, 18.0));
+    if button(ui, b, ("rm", uid), "✕", None).on_hover_text("Remove device").clicked() {
+        actions.push(RackAction::Remove(di));
+    }
+    rx -= 32.0;
+    if di + 1 < count {
+        let b = Rect::from_min_size(pos2(rx - 24.0, by), vec2(24.0, 18.0));
+        if button(ui, b, ("right", uid), "▶", None).on_hover_text("Move right").clicked() {
+            actions.push(RackAction::Move(di, di + 1));
+        }
+    }
+    rx -= 28.0;
+    if di > 0 {
+        let b = Rect::from_min_size(pos2(rx - 24.0, by), vec2(24.0, 18.0));
+        if button(ui, b, ("left", uid), "◀", None).on_hover_text("Move left").clicked() {
+            actions.push(RackAction::Move(di, di - 1));
+        }
+    }
+    by
 }

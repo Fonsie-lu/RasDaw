@@ -19,7 +19,7 @@ use clap_sys::process::{clap_process, CLAP_PROCESS_ERROR};
 use clap_sys::stream::{clap_istream, clap_ostream};
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -75,7 +75,6 @@ struct AudioSide {
     max_frames: usize,
 }
 
-static NEXT_UID: AtomicU64 = AtomicU64::new(1);
 
 pub struct PluginInstance {
     pub uid: u64,
@@ -112,7 +111,7 @@ impl PluginInstance {
         let (param_tx, param_rx) = rtrb::RingBuffer::new(1024);
         let (out_tx, out_rx) = rtrb::RingBuffer::new(1024);
         let mut inst = Self {
-            uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
+            uid: super::next_uid(),
             desc: desc.clone(),
             plugin,
             host,
@@ -252,7 +251,8 @@ impl PluginInstance {
         }
     }
 
-    /// Runs one block. `input` and `output` are stereo; `notes` must be sorted by time.
+    /// Runs one block. `input` and `output` are stereo; `notes` must be sorted by time. `midi`
+    /// holds raw channel messages (CC, pitch bend, pressure) delivered at the block start.
     /// Returns false if the plugin could not process (the caller then passes audio through).
     /// Audio thread only.
     pub fn process(
@@ -261,6 +261,7 @@ impl PluginInstance {
         output: [&mut [f32]; 2],
         frames: usize,
         notes: &[NoteEvent],
+        midi: &[[u8; 3]],
         transport: &clap_event_transport,
     ) -> bool {
         if !self.start_processing() {
@@ -274,6 +275,9 @@ impl PluginInstance {
         audio.events.clear();
         while let Ok((id, value)) = audio.param_rx.pop() {
             audio.events.param(0, id, value);
+        }
+        for m in midi {
+            audio.events.midi(0, *m);
         }
         for n in notes {
             audio

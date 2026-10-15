@@ -160,6 +160,12 @@ impl App {
                 PlayMode::Silent => "—".to_owned(),
             };
             caption(&hp, head.min + vec2(16.0, 27.0), Align2::LEFT_TOP, &mode, 9.5, t.text_dim);
+            if selected {
+                // The selected track receives the MIDI keyboard.
+                let badge = Rect::from_min_size(pos2(head_x1 - 64.0, y + 26.0), vec2(36.0, 13.0));
+                hp.rect_filled(badge, widgets::r(2.0), with_alpha(t.play, 0.85));
+                caption(&hp, badge.center(), Align2::CENTER_CENTER, "MIDI", 9.0, t.bar_text);
+            }
             let mb = Rect::from_min_size(head.min + vec2(16.0, ROW_H - 22.0), vec2(22.0, 15.0));
             if button(ui, mb, ("mute", track.id), "M", track.mute.then_some(t.mute)).clicked() {
                 action = Some((i, LaneAction::Mute));

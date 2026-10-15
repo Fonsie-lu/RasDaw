@@ -3,7 +3,8 @@
 //! Set DAW_TEST_PLUGIN=<clap id> to pick one; the default prefers Alpha Juno.
 
 use rasdaw::clap_host::{self, PluginInstance, Registry};
-use rasdaw::engine::{self, Command, DeviceSnap, Snapshot};
+use rasdaw::engine::{self, Command, DeviceRef, DeviceSnap, Snapshot};
+use rasdaw::devices::{BuiltinDevice, Kind};
 use rasdaw::model::Project;
 
 #[test]
@@ -38,9 +39,17 @@ fn instrument_plays_scene_notes() {
     let lead = project.tracks[0].id;
     let (mut engine, mut handle) = engine::new(48_000.0, 512);
     let dev = inst.clone();
+    // Built-in limiter after the instrument: +12 dB into a -12 dB ceiling.
+    let limiter = BuiltinDevice::new(Kind::Limiter, 48_000.0);
+    limiter.set_value(0, 12.0);
+    limiter.set_value(1, -12.0);
+    let ceiling = 10f32.powf(-12.0 / 20.0);
     handle.publish(Snapshot::build(&project, |id| {
         if id == lead {
-            vec![DeviceSnap { instance: dev.clone(), bypass: false }]
+            vec![
+                DeviceSnap { device: DeviceRef::Clap(dev.clone()), bypass: false },
+                DeviceSnap { device: DeviceRef::Builtin(limiter.clone()), bypass: false },
+            ]
         } else {
             Vec::new()
         }
@@ -64,6 +73,8 @@ fn instrument_plays_scene_notes() {
     handle.collect_garbage();
     eprintln!("peak {peak}");
     assert!(peak > 1e-3, "instrument stayed silent (peak {peak})");
+    // Track volume 0.8 is unity and pan centre is unity, so the limiter ceiling holds at the output.
+    assert!(peak <= ceiling + 1e-3, "limiter in the chain did not hold {ceiling} (peak {peak})");
     assert!(peak.is_finite());
     drop(inst);
 }

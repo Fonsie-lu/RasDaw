@@ -1,7 +1,8 @@
 # RasDaw (Fonsie Audio): project notes for Claude
 
 RasDaw by Fonsie Audio: a Bitwig-inspired DAW framework in Rust that hosts **CLAP** plugins.
-It ships no instruments or effects of its own. The GUI style follows `~/tools/juno-clone` (coloured section bars, raised
+It bundles six basic effect devices (EQ-5, Compressor, Limiter, Distortion, Delay, Reverb) that
+live inside the DAW, not as separate plugins. It ships no instruments. The GUI style follows `~/tools/juno-clone` (coloured section bars, raised
 buttons, fader caps, ribbed knobs) with a Tokyo Night colour scheme.
 
 ## Commands
@@ -36,6 +37,12 @@ cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one pl
 | `src/engine/mod.rs` | Real-time engine: `Snapshot` (built from the project), `EngineHandle` (UI side), `Engine` (audio side), transport, device chains, meters |
 | `src/engine/sequencer.rs` | Pure note scheduling: `Source` (arrangement / looping scene / silent), `Voices`, `render()` |
 | `src/audio.rs` | Output drivers via dlopen: PulseAudio simple API, ALSA, null |
+| `src/devices/mod.rs` | Built-in devices: `Kind` (ids, names, param tables), `ParamDef` (ranges, log travel, formatting), `BuiltinDevice` (atomic params + audio-thread DSP), `Dsp` trait, tests and a CPU report |
+| `src/devices/dsp.rs` | Biquad (RBJ cookbook) with `magnitude()`, `DelayLine`, dB helpers |
+| `src/devices/eq.rs` | EQ-5 plus fixed 20 Hz HP / 16 kHz LP (Butterworth 4th order) and mono below 100 Hz (LR4 high-pass on the side signal); `response_db()` for the graph |
+| `src/devices/dynamics.rs` | Compressor (soft knee, stereo linked) and look-ahead limiter (1.5 ms) |
+| `src/devices/fx.rs` | Delay (sync, ping-pong, filtered feedback), Reverb (Freeverb topology + pre-delay + low cut), Distortion (soft/hard/fold/tube) |
+| `src/midi.rs` | MIDI keyboard input: ALSA sequencer via dlopen, own thread, hot-plug auto-connect of hardware ports, `MidiInput` (UI handle: port list, connect/disconnect) |
 | `src/clap_host/scan.rs` | Search path, `PluginLibrary` (dlopen + `clap_entry`), `PluginDesc`, `Registry` |
 | `src/clap_host/instance.rs` | `PluginInstance`: create/init/activate, `process`, params, state, GUI calls, `idle()` |
 | `src/clap_host/host.rs` | `clap_host` and host extensions (log, thread-check, params, gui, timer, posix-fd, state, latency, audio/note ports) |
@@ -46,9 +53,11 @@ cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one pl
 | `src/ui/launcher.rs` | Scene launcher (top left), shared row scrolling |
 | `src/ui/arranger.rs` | Track headers + timeline (top right), `mini_notes()` |
 | `src/ui/piano_roll.rs` | Piano roll for timeline notes or a scene clip |
-| `src/ui/rack.rs` | Channel strip, device cards with parameter knobs, plugin browser |
+| `src/ui/rack.rs` | Channel strip, CLAP device cards (paged knobs), shared card header, device browser |
+| `src/ui/builtin_card.rs` | Built-in device cards: all knobs at once, EQ graph with draggable band handles, gain reduction meter |
 | `src/ui/widgets.rs` | Juno-style drawing helpers, fonts, egui visuals |
 | `tests/clap_host.rs` | Hosts a real instrument through the engine and checks for sound |
+| `tests/midi.rs` | A second sequencer client plays notes into RasDaw's port; checks they reach the target track |
 
 ## Identity
 
@@ -64,6 +73,31 @@ cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one pl
 - Scenes only sound while the transport runs. Launching a scene or a slot starts it.
 - Rows of the launcher and the arranger share `ROW_H` and `View::scroll_y`, so they line up.
 - Double-click a lane, a track header or a scene slot to open the piano roll; ESC returns.
+- **MIDI keyboard:**
+  - The selected track receives MIDI input (green MIDI badge on its header).
+  - Note on/off become CLAP note events. Other channel messages (CC, pitch bend, pressure,
+    program change) go to the plugins as raw `CLAP_EVENT_MIDI`, all at the start of the
+    next block (jitter up to one period).
+  - A note-off goes to the track that got the note-on, even if the selection changed in
+    between. On a target change the old track also gets sustain off and pitch bend centred.
+  - Hardware ports (sequencer port type `HARDWARE`, not "Midi Through") connect
+    automatically, also when plugged in later. Software ports are listed in the MIDI menu
+    and connected by hand. Manual choices last for the session only.
+  - Keys held on the target track light up on the piano roll keyboard.
+
+## Built-in devices
+
+- `DeviceSpec::plugin_id` is `rasdaw.<name>` (`Kind::id`); never change these ids or any
+  `ParamDef::key`, they are stored in projects. Values are saved in `DeviceSpec::params`
+  (a key → value map), not in `state`.
+- The chain type is `engine::DeviceRef` (`Clap` or `Builtin`); the rack's
+  `HashMap<u64, Vec<Option<DeviceRef>>>` stays parallel to `Track::devices`.
+- They have no editor window; everything is set in the rack card.
+- Parameters are atomics (UI writes, audio thread reads once per block). The DSP state and all
+  buffers are allocated in `BuiltinDevice::new` on the main thread.
+- To add a device: a `Kind` variant (id, name, description, params, `make_dsp`), a `Dsp`
+  impl, and optionally `rows()`, `param_active()` or a display in `builtin_card.rs`.
+- The audio thread sets FTZ/DAZ (`audio::enable_flush_to_zero`) against denormal slowdowns.
 
 ## Real-time and threading rules
 
@@ -91,7 +125,7 @@ cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one pl
 ## Not done yet
 
 - Plugin latency compensation, `request_restart` (logged and ignored), audio-ports rescan.
-- MIDI input from hardware, recording, automation, undo.
+- MIDI recording into clips, MIDI output, MIDI learn, automation, undo.
 - Note velocity editing, multi-note selection, copy/paste.
 - Clips on the timeline are one region per track (the whole timeline); there is no clip
   splitting.

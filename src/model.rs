@@ -61,6 +61,9 @@ pub struct DeviceSpec {
     /// Plugin state from the CLAP state extension. Filled in when the project is saved.
     #[serde(default)]
     pub state: Option<Vec<u8>>,
+    /// Parameter values of a built-in device (`plugin_id` starts with `rasdaw.`), by key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<std::collections::BTreeMap<String, f32>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -247,6 +250,14 @@ mod tests {
             name: "Y".into(),
             bypass: true,
             state: Some(vec![1, 2, 3]),
+            params: None,
+        });
+        p.tracks[1].devices.push(DeviceSpec {
+            plugin_id: "rasdaw.delay".into(),
+            name: "Delay".into(),
+            bypass: false,
+            state: None,
+            params: Some([("mix".to_owned(), 0.5)].into_iter().collect()),
         });
         let back = Project::from_json(&p.to_json()).unwrap();
         assert_eq!(p, back);

@@ -56,8 +56,8 @@ pub struct Theme {
 
     /// Track colours, indexed by `Track::color`.
     pub tracks: [Color32; 8],
-    /// Section bar colours of the device rack (instrument, effect, unknown).
-    pub device_bars: [Color32; 3],
+    /// Section bar colours of the device rack (instrument, effect, unknown, built-in).
+    pub device_bars: [Color32; 4],
 }
 
 const fn c(hex: u32) -> Color32 {
@@ -120,7 +120,7 @@ pub const TOKYO_NIGHT: Theme = Theme {
         c(0x1abc9c),
         c(0xf7768e),
     ],
-    device_bars: [c(0xbb9af7), c(0x7dcfff), c(0x737aa2)],
+    device_bars: [c(0xbb9af7), c(0x7dcfff), c(0x737aa2), c(0x1abc9c)],
 };
 
 pub fn current() -> &'static Theme {

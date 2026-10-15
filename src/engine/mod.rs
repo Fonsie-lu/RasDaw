@@ -12,6 +12,8 @@ pub mod sequencer;
 pub use sequencer::NoteEvent;
 
 use crate::clap_host::PluginInstance;
+use crate::devices::BuiltinDevice;
+use crate::midi::MidiMsg;
 use crate::model::{PlayMode, Project, BEATS_PER_BAR};
 use clap_sys::events::*;
 use clap_sys::fixedpoint::{CLAP_BEATTIME_FACTOR, CLAP_SECTIME_FACTOR};
@@ -23,8 +25,51 @@ use std::time::Instant;
 
 pub const MAX_TRACKS: usize = 128;
 
+/// A device in a track chain: a hosted CLAP plugin or a built-in RasDaw device.
+#[derive(Clone)]
+pub enum DeviceRef {
+    Clap(Arc<PluginInstance>),
+    Builtin(Arc<BuiltinDevice>),
+}
+
+impl DeviceRef {
+    pub fn uid(&self) -> u64 {
+        match self {
+            DeviceRef::Clap(i) => i.uid,
+            DeviceRef::Builtin(d) => d.uid,
+        }
+    }
+
+    /// Audio thread only. Returns false if nothing was written to `output`.
+    #[allow(clippy::too_many_arguments)]
+    fn process(
+        &self,
+        input: [&[f32]; 2],
+        output: [&mut [f32]; 2],
+        n: usize,
+        notes: &[NoteEvent],
+        midi: &[MidiMsg],
+        transport: &clap_event_transport,
+    ) -> bool {
+        match self {
+            DeviceRef::Clap(i) => i.process(input, output, n, notes, midi, transport),
+            DeviceRef::Builtin(d) => {
+                d.process(input, output, n, transport.tempo);
+                true
+            }
+        }
+    }
+
+    /// Audio thread only.
+    fn stop_processing(&self) {
+        if let DeviceRef::Clap(i) = self {
+            i.stop_processing();
+        }
+    }
+}
+
 pub struct DeviceSnap {
-    pub instance: Arc<PluginInstance>,
+    pub device: DeviceRef,
     pub bypass: bool,
 }
 
@@ -132,12 +177,25 @@ pub enum Command {
     Note { track: u64, key: u8, velocity: f32, on: bool },
 }
 
+/// A live event waiting for the next block of one track.
+#[derive(Clone, Copy)]
+enum Live {
+    Note { key: u8, velocity: f32, on: bool },
+    /// Any other MIDI channel message (CC, pitch bend, pressure, program change).
+    Midi(MidiMsg),
+}
+
 pub struct Shared {
     playing: AtomicBool,
     position: AtomicU64,
     peaks: Vec<[AtomicU32; 2]>,
     master: [AtomicU32; 2],
     load: AtomicU32,
+    /// Track id that receives MIDI keyboard input (0 = none).
+    midi_target: AtomicU64,
+    midi_activity: AtomicU32,
+    /// Keys held live (MIDI keyboard or preview) on the MIDI target track, as a bit set.
+    live_keys: [AtomicU64; 2],
 }
 
 impl Shared {
@@ -148,7 +206,30 @@ impl Shared {
             peaks: (0..MAX_TRACKS).map(|_| [AtomicU32::new(0), AtomicU32::new(0)]).collect(),
             master: [AtomicU32::new(0), AtomicU32::new(0)],
             load: AtomicU32::new(0),
+            midi_target: AtomicU64::new(0),
+            midi_activity: AtomicU32::new(0),
+            live_keys: [AtomicU64::new(0), AtomicU64::new(0)],
         }
+    }
+
+    /// Routes MIDI keyboard input to the track with this id (0 = nowhere).
+    pub fn set_midi_target(&self, track: u64) {
+        self.midi_target.store(track, Ordering::Relaxed);
+    }
+
+    /// Counts up with every incoming MIDI message (drives the activity LED).
+    pub fn midi_activity_count(&self) -> u32 {
+        self.midi_activity.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn midi_activity(&self) {
+        self.midi_activity.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether `key` is held live on the MIDI target track.
+    pub fn live_key(&self, key: u8) -> bool {
+        let k = key as usize & 127;
+        self.live_keys[k / 64].load(Ordering::Relaxed) & (1 << (k % 64)) != 0
     }
 
     pub fn playing(&self) -> bool {
@@ -193,6 +274,7 @@ pub struct EngineHandle {
     commands: rtrb::Producer<Command>,
     snapshots: rtrb::Producer<Arc<Snapshot>>,
     garbage: rtrb::Consumer<Arc<Snapshot>>,
+    midi: Option<rtrb::Producer<MidiMsg>>,
     pub shared: Arc<Shared>,
     pub sample_rate: f64,
     pub max_block: u32,
@@ -209,6 +291,11 @@ impl EngineHandle {
         }
     }
 
+    /// The producer end of the engine's MIDI input queue (for the MIDI thread). Only once.
+    pub fn take_midi_input(&mut self) -> Option<rtrb::Producer<MidiMsg>> {
+        self.midi.take()
+    }
+
     /// Drops snapshots the engine is done with. Call regularly from the UI thread.
     pub fn collect_garbage(&mut self) {
         while self.garbage.pop().is_ok() {}
@@ -221,7 +308,7 @@ struct TrackRt {
     voices: Voices,
     live: [bool; 128],
     release: bool,
-    pending: [(u8, f32, bool); 32],
+    pending: [Live; 64],
     pending_len: usize,
 }
 
@@ -233,9 +320,22 @@ impl TrackRt {
             voices: Voices::default(),
             live: [false; 128],
             release: false,
-            pending: [(0, 0.0, false); 32],
+            pending: [Live::Midi([0; 3]); 64],
             pending_len: 0,
         }
+    }
+
+    fn push(&mut self, live: Live) {
+        if self.pending_len < self.pending.len() {
+            self.pending[self.pending_len] = live;
+            self.pending_len += 1;
+        }
+    }
+}
+
+fn push_live(rt: &mut [TrackRt], track: u64, live: Live) {
+    if let Some(rt) = rt.iter_mut().find(|r| r.id == track) {
+        rt.push(live);
     }
 }
 
@@ -248,6 +348,12 @@ struct Bufs {
 
 pub struct Engine {
     commands: rtrb::Consumer<Command>,
+    midi: rtrb::Consumer<MidiMsg>,
+    /// Track that received MIDI input in the last block, and the track each held key went to
+    /// (so note-offs reach the right track after the selection changed).
+    midi_target: u64,
+    midi_owner: [u64; 128],
+    midi_events: Vec<MidiMsg>,
     snapshots: rtrb::Consumer<Arc<Snapshot>>,
     garbage: rtrb::Producer<Arc<Snapshot>>,
     /// Retired snapshots that did not fit into the garbage queue yet.
@@ -269,11 +375,16 @@ pub fn new(sample_rate: f64, max_block: u32) -> (Engine, EngineHandle) {
     let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(1024);
     let (snap_tx, snap_rx) = rtrb::RingBuffer::new(64);
     let (garbage_tx, garbage_rx) = rtrb::RingBuffer::new(256);
+    let (midi_tx, midi_rx) = rtrb::RingBuffer::new(1024);
     let shared = Arc::new(Shared::new());
     let n = max_block as usize;
     let buf = || [vec![0.0f32; n], vec![0.0f32; n]];
     let engine = Engine {
         commands: cmd_rx,
+        midi: midi_rx,
+        midi_target: 0,
+        midi_owner: [0; 128],
+        midi_events: Vec::with_capacity(256),
         snapshots: snap_rx,
         garbage: garbage_tx,
         held: Vec::with_capacity(64),
@@ -297,6 +408,7 @@ pub fn new(sample_rate: f64, max_block: u32) -> (Engine, EngineHandle) {
         commands: cmd_tx,
         snapshots: snap_tx,
         garbage: garbage_rx,
+        midi: Some(midi_tx),
         shared,
         sample_rate,
         max_block,
@@ -334,6 +446,7 @@ impl Engine {
     pub fn render_block(&mut self, n: usize) {
         self.take_snapshots();
         self.handle_commands();
+        self.handle_midi();
 
         let snap = self.current.clone();
         let fpb = self.sample_rate * 60.0 / snap.bpm.max(1.0);
@@ -379,19 +492,36 @@ impl Engine {
             let rt = &mut self.rt[i];
             let events = &mut self.events;
             events.clear();
+            let midi_events = &mut self.midi_events;
+            midi_events.clear();
             if release_all || rt.release {
                 rt.release = false;
                 rt.voices.release_all(0, events);
             }
-            for &(key, velocity, on) in &rt.pending[..rt.pending_len] {
-                let k = key as usize & 127;
-                if on && rt.live[k] {
-                    events.push(NoteEvent { time: 0, on: false, key, velocity: 0.0 });
+            for live in &rt.pending[..rt.pending_len] {
+                match *live {
+                    Live::Note { key, velocity, on } => {
+                        let k = key as usize & 127;
+                        if on && rt.live[k] {
+                            events.push(NoteEvent { time: 0, on: false, key, velocity: 0.0 });
+                        }
+                        rt.live[k] = on;
+                        events.push(NoteEvent { time: 0, on, key, velocity });
+                    }
+                    Live::Midi(m) => midi_events.push(m),
                 }
-                rt.live[k] = on;
-                events.push(NoteEvent { time: 0, on, key, velocity });
             }
             rt.pending_len = 0;
+            if track.id == self.midi_target {
+                let mut bits = [0u64; 2];
+                for (k, &on) in rt.live.iter().enumerate() {
+                    if on {
+                        bits[k / 64] |= 1 << (k % 64);
+                    }
+                }
+                self.shared.live_keys[0].store(bits[0], Ordering::Relaxed);
+                self.shared.live_keys[1].store(bits[1], Ordering::Relaxed);
+            }
             if let Some(s) = spans[0] {
                 sequencer::render(&track.source, &mut rt.voices, s, events);
             }
@@ -414,7 +544,7 @@ impl Engine {
                 }
                 let [il, ir] = &bufs.a;
                 let [ol, or] = &mut bufs.b;
-                if dev.instance.process([il, ir], [ol, or], n, events, &transport) {
+                if dev.device.process([il, ir], [ol, or], n, events, midi_events, &transport) {
                     std::mem::swap(&mut bufs.a, &mut bufs.b);
                 }
             }
@@ -510,9 +640,9 @@ impl Engine {
                         .current
                         .tracks
                         .iter()
-                        .any(|nt| nt.devices.iter().any(|nd| nd.instance.uid == d.instance.uid));
+                        .any(|nt| nt.devices.iter().any(|nd| nd.device.uid() == d.device.uid()));
                     if !still_used {
-                        d.instance.stop_processing();
+                        d.device.stop_processing();
                     }
                 }
             }
@@ -567,13 +697,47 @@ impl Engine {
                     self.release_all = true;
                 }
                 Command::Note { track, key, velocity, on } => {
-                    if let Some(rt) = self.rt.iter_mut().find(|r| r.id == track) {
-                        if rt.pending_len < rt.pending.len() {
-                            rt.pending[rt.pending_len] = (key, velocity, on);
-                            rt.pending_len += 1;
-                        }
+                    push_live(&mut self.rt, track, Live::Note { key, velocity, on });
+                }
+            }
+        }
+    }
+
+    /// Routes MIDI keyboard input to the target track. When the target changes, the old
+    /// track gets its held notes, sustain and pitch bend released.
+    fn handle_midi(&mut self) {
+        let target = self.shared.midi_target.load(Ordering::Relaxed);
+        if target != self.midi_target {
+            let old = self.midi_target;
+            if let Some(rt) = self.rt.iter_mut().find(|r| r.id == old) {
+                for key in 0..128u8 {
+                    if rt.live[key as usize] {
+                        rt.push(Live::Note { key, velocity: 0.0, on: false });
                     }
                 }
+                rt.push(Live::Midi([0xb0, 64, 0]));
+                rt.push(Live::Midi([0xe0, 0, 64]));
+            }
+            if !self.rt.iter().any(|r| r.id == target) {
+                self.shared.live_keys[0].store(0, Ordering::Relaxed);
+                self.shared.live_keys[1].store(0, Ordering::Relaxed);
+            }
+            self.midi_target = target;
+        }
+        while let Ok(m) = self.midi.pop() {
+            let key = (m[1] & 0x7f) as usize;
+            match m[0] & 0xf0 {
+                0x90 if m[2] > 0 => {
+                    self.midi_owner[key] = target;
+                    let velocity = m[2] as f32 / 127.0;
+                    push_live(&mut self.rt, target, Live::Note { key: key as u8, velocity, on: true });
+                }
+                0x80 | 0x90 => {
+                    let owner = std::mem::take(&mut self.midi_owner[key]);
+                    let to = if owner != 0 { owner } else { target };
+                    push_live(&mut self.rt, to, Live::Note { key: key as u8, velocity: 0.0, on: false });
+                }
+                _ => push_live(&mut self.rt, target, Live::Midi(m)),
             }
         }
     }
@@ -584,7 +748,7 @@ impl Drop for Engine {
     fn drop(&mut self) {
         for t in &self.current.tracks {
             for d in &t.devices {
-                d.instance.stop_processing();
+                d.device.stop_processing();
             }
         }
     }

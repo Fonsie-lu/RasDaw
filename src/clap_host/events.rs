@@ -11,6 +11,7 @@ pub union EventSlot {
     pub header: clap_event_header,
     pub note: clap_event_note,
     pub param: clap_event_param_value,
+    pub midi: clap_event_midi,
 }
 
 /// Input events. `list` points back at `self`, so the struct must not move while the plugin
@@ -57,6 +58,16 @@ impl InputEvents {
                 channel: 0,
                 key: key as i16,
                 velocity,
+            },
+        });
+    }
+
+    pub fn midi(&mut self, time: u32, data: [u8; 3]) {
+        self.push(EventSlot {
+            midi: clap_event_midi {
+                header: header::<clap_event_midi>(time, CLAP_EVENT_MIDI),
+                port_index: 0,
+                data,
             },
         });
     }

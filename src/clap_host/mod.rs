@@ -18,6 +18,14 @@ pub use instance::PluginInstance;
 pub use scan::{PluginDesc, Registry};
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_UID: AtomicU64 = AtomicU64::new(1);
+
+/// Unique id for any device instance (CLAP or built-in), used as UI key.
+pub fn next_uid() -> u64 {
+    NEXT_UID.fetch_add(1, Ordering::Relaxed)
+}
 
 thread_local! {
     static THREAD_ROLE: Cell<u8> = const { Cell::new(0) };

@@ -101,6 +101,7 @@ pub fn start(backend: Backend, mut engine: Engine) -> Stream {
         .name("audio".into())
         .spawn(move || {
             crate::clap_host::mark_audio_thread();
+            enable_flush_to_zero();
             match backend {
                 Backend::Pulse(pulse) => pulse.run(&mut engine, &stop2),
                 Backend::Alsa(alsa) => alsa.run(&mut engine, &stop2),
@@ -112,6 +113,18 @@ pub fn start(backend: Backend, mut engine: Engine) -> Stream {
     Stream {
         stop,
         thread: Some(thread),
+    }
+}
+
+/// Flushes denormals to zero on this thread, so decaying feedback loops (reverb, delay) do
+/// not slow down to a crawl.
+fn enable_flush_to_zero() {
+    #[cfg(target_arch = "x86_64")]
+    #[allow(deprecated)]
+    unsafe {
+        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        // FTZ (bit 15) and DAZ (bit 6)
+        _mm_setcsr(_mm_getcsr() | 0x8040);
     }
 }
 

@@ -126,7 +126,8 @@ impl App {
             }
             // Keyboard
             let key_rect = Rect::from_min_max(pos2(keys.left(), y), pos2(keys.right(), y + kh));
-            let pressed = self.view.pr.preview_key == Some(k);
+            let midi_target = self.view.selected_track == ti;
+            let pressed = self.view.pr.preview_key == Some(k) || (midi_target && self.engine.shared.live_key(k));
             let fill = if pressed { color } else if is_black(k) { t.key_black } else { t.key_white };
             kp.rect_filled(key_rect.shrink2(vec2(0.0, 0.5)), widgets::r(1.0), fill);
             if k % 12 == 0 {

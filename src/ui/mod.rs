@@ -6,9 +6,11 @@
 //! - top right: track headers and the arranger timeline, rows aligned with the scene rows;
 //!   double-clicking a lane (or a scene slot) replaces the timeline with the piano roll, ESC
 //!   returns
+//! - the selected track receives the MIDI keyboard (see `midi.rs`)
 //! - bottom: device rack of the selected track, left to right in signal order
 
 mod arranger;
+mod builtin_card;
 mod launcher;
 mod piano_roll;
 mod rack;
@@ -18,7 +20,9 @@ pub mod widgets;
 use crate::audio::{self, DriverInfo};
 use crate::clap_host::gui::GuiManager;
 use crate::clap_host::{PluginDesc, PluginInstance, Registry};
-use crate::engine::{Command, DeviceSnap, EngineHandle, Snapshot};
+use crate::devices::{BuiltinDevice, Kind};
+use crate::engine::{Command, DeviceRef, DeviceSnap, EngineHandle, Snapshot};
+use crate::midi::MidiInput;
 use crate::model::{Clip, DeviceSpec, Project, BEATS_PER_BAR};
 use crate::theme::current as th;
 use eframe::egui::{self, Key};
@@ -112,6 +116,9 @@ pub struct View {
     /// Smoothed meter levels per track index, and the master.
     pub meters: Vec<[f32; 2]>,
     pub master_meter: [f32; 2],
+    /// MIDI activity counter seen last frame, and when it last changed (LED).
+    pub midi_seen: u32,
+    pub midi_flash: Option<Instant>,
 }
 
 impl Default for View {
@@ -129,6 +136,8 @@ impl Default for View {
             param_page: HashMap::new(),
             meters: Vec::new(),
             master_meter: [0.0; 2],
+            midi_seen: 0,
+            midi_flash: None,
         }
     }
 }
@@ -138,9 +147,10 @@ pub struct App {
     // stops processing on every instance), then the instances are destroyed here.
     gui: GuiManager,
     stream: Option<audio::Stream>,
+    pub midi: MidiInput,
     pub project: Project,
-    /// Live plugin instances per track id, parallel to `Track::devices` (None = failed load).
-    pub rack: HashMap<u64, Vec<Option<Arc<PluginInstance>>>>,
+    /// Live devices per track id, parallel to `Track::devices` (None = failed load).
+    pub rack: HashMap<u64, Vec<Option<DeviceRef>>>,
     pub engine: EngineHandle,
     pub registry: Registry,
     pub driver: DriverInfo,
@@ -160,9 +170,15 @@ impl App {
         registry: Registry,
         path: PathBuf,
     ) -> Self {
+        let mut engine = engine;
+        let midi = match engine.take_midi_input() {
+            Some(queue) => MidiInput::start(queue, engine.shared.clone()),
+            None => unreachable!("the MIDI queue is taken once, here"),
+        };
         let mut app = Self {
             gui: GuiManager::default(),
             stream: Some(stream),
+            midi,
             project: Project::demo(),
             rack: HashMap::new(),
             engine,
@@ -254,6 +270,14 @@ impl App {
             }
             let mut chain = Vec::new();
             for d in &t.devices {
+                if let Some(kind) = Kind::from_id(&d.plugin_id) {
+                    let dev = BuiltinDevice::new(kind, self.engine.sample_rate as f32);
+                    if let Some(map) = &d.params {
+                        dev.load_map(map);
+                    }
+                    chain.push(Some(DeviceRef::Builtin(dev)));
+                    continue;
+                }
                 let inst = match self.registry.find(&d.plugin_id) {
                     Some(desc) => match self.instantiate(desc) {
                         Ok(inst) => {
@@ -262,7 +286,7 @@ impl App {
                                     errors.push(format!("{}: state not restored", d.name));
                                 }
                             }
-                            Some(inst)
+                            Some(DeviceRef::Clap(inst))
                         }
                         Err(e) => {
                             errors.push(e);
@@ -296,8 +320,9 @@ impl App {
                     name: desc.name.clone(),
                     bypass: false,
                     state: None,
+                    params: None,
                 });
-                self.rack.entry(id).or_default().push(Some(inst));
+                self.rack.entry(id).or_default().push(Some(DeviceRef::Clap(inst)));
                 self.dirty = true;
                 self.set_status(format!("added {}", desc.name));
             }
@@ -305,10 +330,26 @@ impl App {
         }
     }
 
+    pub fn add_builtin(&mut self, track: usize, kind: Kind) {
+        let Some(t) = self.project.tracks.get_mut(track) else {
+            return;
+        };
+        let dev = BuiltinDevice::new(kind, self.engine.sample_rate as f32);
+        t.devices.push(DeviceSpec {
+            plugin_id: kind.id().to_owned(),
+            name: kind.name().to_owned(),
+            bypass: false,
+            state: None,
+            params: Some(dev.to_map()),
+        });
+        self.rack.entry(t.id).or_default().push(Some(DeviceRef::Builtin(dev)));
+        self.dirty = true;
+    }
+
     pub fn remove_device(&mut self, track: usize, index: usize) {
         let id = self.project.tracks[track].id;
-        if let Some(Some(inst)) = self.rack.get(&id).and_then(|c| c.get(index)) {
-            self.gui.close(inst.uid);
+        if let Some(Some(dev)) = self.rack.get(&id).and_then(|c| c.get(index)) {
+            self.gui.close(dev.uid());
         }
         self.project.tracks[track].devices.remove(index);
         if let Some(chain) = self.rack.get_mut(&id) {
@@ -348,8 +389,8 @@ impl App {
     pub fn delete_track(&mut self, index: usize) {
         let t = self.project.tracks.remove(index);
         if let Some(chain) = self.rack.remove(&t.id) {
-            for inst in chain.into_iter().flatten() {
-                self.gui.close(inst.uid);
+            for dev in chain.into_iter().flatten() {
+                self.gui.close(dev.uid());
             }
         }
         if self.view.editor.is_some_and(|e| e.track_id() == t.id) {
@@ -375,9 +416,11 @@ impl App {
         self.path = PathBuf::from(self.path_text.trim());
         for t in &mut self.project.tracks {
             if let Some(chain) = self.rack.get(&t.id) {
-                for (spec, inst) in t.devices.iter_mut().zip(chain) {
-                    if let Some(inst) = inst {
-                        spec.state = inst.save_state();
+                for (spec, dev) in t.devices.iter_mut().zip(chain) {
+                    match dev {
+                        Some(DeviceRef::Clap(inst)) => spec.state = inst.save_state(),
+                        Some(DeviceRef::Builtin(dev)) => spec.params = Some(dev.to_map()),
+                        None => {}
                     }
                 }
             }
@@ -424,9 +467,9 @@ impl App {
                     chain
                         .iter()
                         .zip(specs)
-                        .filter_map(|(inst, spec)| {
-                            inst.as_ref().map(|i| DeviceSnap {
-                                instance: i.clone(),
+                        .filter_map(|(dev, spec)| {
+                            dev.as_ref().map(|d| DeviceSnap {
+                                device: d.clone(),
                                 bypass: spec.bypass,
                             })
                         })
@@ -440,8 +483,10 @@ impl App {
 
     fn service_plugins(&mut self) {
         for chain in self.rack.values() {
-            for inst in chain.iter().flatten() {
-                inst.idle();
+            for dev in chain.iter().flatten() {
+                if let DeviceRef::Clap(inst) = dev {
+                    inst.idle();
+                }
             }
         }
         self.gui.poll();
@@ -538,6 +583,14 @@ impl eframe::App for App {
         self.engine.collect_garbage();
         self.service_plugins();
         self.update_meters();
+        // The selected track receives the MIDI keyboard.
+        let target = self.project.tracks.get(self.view.selected_track).map_or(0, |t| t.id);
+        self.engine.shared.set_midi_target(target);
+        let seen = self.engine.shared.midi_activity_count();
+        if seen != self.view.midi_seen {
+            self.view.midi_seen = seen;
+            self.view.midi_flash = Some(Instant::now());
+        }
         self.shortcuts(ctx);
 
         let t = th();
