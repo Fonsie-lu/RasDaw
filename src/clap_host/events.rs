@@ -1,6 +1,7 @@
 //! Preallocated CLAP input and output event lists for the audio thread.
 
 use clap_sys::events::*;
+use crate::engine::NoteEvent;
 use clap_sys::id::clap_id;
 use std::ffi::c_void;
 
@@ -116,10 +117,13 @@ unsafe extern "C" fn in_get(list: *const clap_input_events, index: u32) -> *cons
     }
 }
 
-/// Output events. Only parameter values are kept (they come from the plugin's own GUI or
-/// internal modulation); everything else is accepted and dropped.
+/// Output events:
+/// - parameter values (from the plugin's own GUI or internal modulation) go to the UI queue,
+/// - notes and MIDI are collected per block, so a note-effect plugin can feed the next device.
 pub struct OutputEvents {
     pub params: rtrb::Producer<(clap_id, f64)>,
+    pub notes: Vec<NoteEvent>,
+    pub midi: Vec<[u8; 3]>,
     pub list: clap_output_events,
 }
 
@@ -127,6 +131,8 @@ impl OutputEvents {
     pub fn new(params: rtrb::Producer<(clap_id, f64)>) -> Self {
         Self {
             params,
+            notes: Vec::with_capacity(1024),
+            midi: Vec::with_capacity(256),
             list: clap_output_events {
                 ctx: std::ptr::null_mut(),
                 try_push: Some(out_try_push),
@@ -138,6 +144,17 @@ impl OutputEvents {
         self.list.ctx = self as *mut Self as *mut c_void;
         &self.list
     }
+
+    pub fn clear(&mut self) {
+        self.notes.clear();
+        self.midi.clear();
+    }
+
+    fn note(&mut self, e: NoteEvent) {
+        if self.notes.len() < self.notes.capacity() {
+            self.notes.push(e);
+        }
+    }
 }
 
 unsafe extern "C" fn out_try_push(list: *const clap_output_events, event: *const clap_event_header) -> bool {
@@ -146,9 +163,43 @@ unsafe extern "C" fn out_try_push(list: *const clap_output_events, event: *const
         return false;
     }
     let h = &*event;
-    if h.space_id == CLAP_CORE_EVENT_SPACE_ID && h.type_ == CLAP_EVENT_PARAM_VALUE {
-        let e = &*(event as *const clap_event_param_value);
-        let _ = this.params.push((e.param_id, e.value));
+    if h.space_id != CLAP_CORE_EVENT_SPACE_ID {
+        return true;
+    }
+    match h.type_ {
+        CLAP_EVENT_PARAM_VALUE => {
+            let e = &*(event as *const clap_event_param_value);
+            let _ = this.params.push((e.param_id, e.value));
+        }
+        CLAP_EVENT_NOTE_ON | CLAP_EVENT_NOTE_OFF | CLAP_EVENT_NOTE_CHOKE => {
+            let e = &*(event as *const clap_event_note);
+            if (0..128).contains(&e.key) {
+                this.note(NoteEvent {
+                    time: h.time,
+                    on: h.type_ == CLAP_EVENT_NOTE_ON,
+                    key: e.key as u8,
+                    velocity: e.velocity as f32,
+                });
+            }
+        }
+        CLAP_EVENT_MIDI => {
+            let e = &*(event as *const clap_event_midi);
+            let [status, key, vel] = e.data;
+            match status & 0xf0 {
+                0x90 | 0x80 => this.note(NoteEvent {
+                    time: h.time,
+                    on: status & 0xf0 == 0x90 && vel > 0,
+                    key: key & 0x7f,
+                    velocity: vel as f32 / 127.0,
+                }),
+                _ => {
+                    if this.midi.len() < this.midi.capacity() {
+                        this.midi.push(e.data);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
     true
 }

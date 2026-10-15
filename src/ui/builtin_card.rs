@@ -1,10 +1,12 @@
-//! Rack cards of the built-in devices: all parameters as knobs (no pages, no editor window),
+//! Rack cards of the built-in devices: all parameters at once (no pages, no editor window),
 //! plus an EQ response graph with draggable band handles, or a gain reduction meter.
+//! Note FX use dropdowns for choices with 3-15 entries and flip switches for on/off; all
+//! other parameters are knobs.
 
-use super::rack::{card_header, RackAction, CELL_H};
+use super::rack::{RackAction, BODY_TOP, CELL_H};
 use super::widgets::{self, caption, knob, with_alpha};
 use super::App;
-use crate::devices::{eq, BuiltinDevice, Kind};
+use crate::devices::{eq, BuiltinDevice, Kind, Unit};
 use crate::theme::current as th;
 use eframe::egui::{self, pos2, vec2, Align2, Id, Pos2, Rect, Sense, Shape, Stroke};
 use std::sync::Arc;
@@ -12,15 +14,14 @@ use std::sync::Arc;
 const CELL_W: f32 = 70.0;
 const EQ_GRAPH_W: f32 = 230.0;
 const GR_W: f32 = 26.0;
-/// Space above the knob grid (bar and button row) and below it (footer).
-const GRID_TOP: f32 = 56.0;
-const FOOTER: f32 = 22.0;
+/// Space below the knob grid.
+const BOTTOM: f32 = 6.0;
 
 fn layout(kind: Kind, h: f32) -> (usize, usize) {
     let n = kind.params().len();
     let rows = kind
         .rows()
-        .unwrap_or_else(|| (((h - GRID_TOP - FOOTER) / CELL_H).floor() as usize).clamp(1, 4))
+        .unwrap_or_else(|| (((h - BODY_TOP - BOTTOM) / CELL_H).floor() as usize).clamp(1, 4))
         .min(n);
     (rows, n.div_ceil(rows))
 }
@@ -40,23 +41,21 @@ pub fn width(kind: Kind, h: f32) -> f32 {
 }
 
 impl App {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn builtin_card(
         &self,
         ui: &mut egui::Ui,
         rect: Rect,
         di: usize,
-        count: usize,
         spec: &crate::model::DeviceSpec,
         dev: &Arc<BuiltinDevice>,
         actions: &mut Vec<RackAction>,
     ) {
         let t = th();
         let accent = t.device_bars[3];
-        card_header(ui, rect, di, count, dev.uid, spec, accent, actions);
+        let body = self.device_frame(ui, rect, di, dev.uid, spec, accent, false, 0.0, actions);
         let p = ui.painter().clone();
-        let grid_top = rect.top() + GRID_TOP;
-        let grid_bottom = rect.bottom() - FOOTER;
+        let grid_top = body.top();
+        let grid_bottom = rect.bottom() - BOTTOM;
         let (rows, _) = layout(dev.kind, rect.height());
         let cell_h = (grid_bottom - grid_top) / rows as f32;
         let mut x0 = rect.left() + 6.0;
@@ -76,6 +75,43 @@ impl App {
             let radius = 14.0;
             let cy = grid_top + cell_h * row as f32 + (cell_h - CELL_H).max(0.0) * 0.5 + radius + 4.0;
             let value = dev.value(i);
+            let name_color = if active { t.text } else { t.text_faint };
+            // Note FX: finite choices get a dropdown (3-15 entries) or a flip switch (2).
+            let choices = match def.unit {
+                Unit::Choice(labels) if dev.kind.is_note() => Some(labels),
+                _ => None,
+            };
+            if let Some(labels) = choices.filter(|l| (3..=15).contains(&l.len())) {
+                let mut idx = value.round() as usize;
+                let r = Rect::from_center_size(pos2(cx, cy), vec2(CELL_W - 6.0, 22.0));
+                // A child Ui: `ui.put` would move the rack's horizontal layout cursor.
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
+                egui::ComboBox::from_id_salt(("builtin_choice", dev.uid, i))
+                    .width(CELL_W - 6.0)
+                    .selected_text(labels.get(idx).copied().unwrap_or("?"))
+                    .show_ui(&mut child, |ui| {
+                        for (k, label) in labels.iter().enumerate() {
+                            ui.selectable_value(&mut idx, k, *label);
+                        }
+                    });
+                if idx as f32 != value.round() {
+                    dev.set_value(i, idx as f32);
+                }
+                caption(&p, pos2(cx, cy + radius + 9.0), Align2::CENTER_CENTER, &widgets::fit_text(ui, def.name, 9.5, CELL_W - 4.0), 9.5, name_color);
+                continue;
+            }
+            if choices.is_some_and(|l| l.len() == 2) {
+                let on = value >= 0.5;
+                let r = Rect::from_center_size(pos2(cx, cy), vec2(38.0, 20.0));
+                if widgets::flip_switch(ui, r, ("builtin_switch", dev.uid, i), on, knob_accent).clicked() {
+                    dev.set_value(i, if on { 0.0 } else { 1.0 });
+                }
+                caption(&p, pos2(cx, cy + radius + 9.0), Align2::CENTER_CENTER, &widgets::fit_text(ui, def.name, 9.5, CELL_W - 4.0), 9.5, name_color);
+                if cell_h >= 56.0 {
+                    caption(&p, pos2(cx, cy + radius + 21.0), Align2::CENTER_CENTER, &def.format(value), 9.0, t.text_dim);
+                }
+                continue;
+            }
             let (resp, new) = knob(ui, pos2(cx, cy), radius, ("builtin", dev.uid, i), def.to_norm(value), def.to_norm(def.default), knob_accent);
             let shown = match new {
                 Some(n) => {
@@ -86,7 +122,7 @@ impl App {
                 None => value,
             };
             let text = def.format(shown);
-            caption(&p, pos2(cx, cy + radius + 9.0), Align2::CENTER_CENTER, &widgets::fit_text(ui, def.name, 9.5, CELL_W - 4.0), 9.5, if active { t.text } else { t.text_faint });
+            caption(&p, pos2(cx, cy + radius + 9.0), Align2::CENTER_CENTER, &widgets::fit_text(ui, def.name, 9.5, CELL_W - 4.0), 9.5, name_color);
             if cell_h >= 56.0 {
                 caption(&p, pos2(cx, cy + radius + 21.0), Align2::CENTER_CENTER, &widgets::fit_text(ui, &text, 9.0, CELL_W - 4.0), 9.0, t.text_dim);
             }
@@ -98,9 +134,6 @@ impl App {
             gr_meter(&p, m, dev.gain_reduction_db());
         }
 
-        let fy = rect.bottom() - 11.0;
-        let footer = format!("RASDAW · {}", dev.kind.description());
-        caption(&p, pos2(rect.left() + 8.0, fy), Align2::LEFT_CENTER, &widgets::fit_text(ui, &footer, 9.0, rect.width() - 16.0), 9.0, t.text_faint);
     }
 }
 

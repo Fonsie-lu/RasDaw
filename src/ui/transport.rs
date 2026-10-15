@@ -3,6 +3,7 @@
 use super::widgets::{self, button, caption, font, meter, mono};
 use super::App;
 use crate::engine::Command;
+use crate::settings::{LAUNCH_QUANTIZE, UI_SCALES};
 use crate::theme::current as th;
 use eframe::egui::{self, pos2, vec2, Align2, Rect, Stroke};
 
@@ -69,8 +70,12 @@ impl App {
         x += 62.0;
         self.midi_button(ui, &p, x, cy);
         x += 76.0;
+        self.scale_button(ui, x, cy);
+        x += 70.0;
+        self.launch_quantize_menu(ui, &p, x, cy);
+        x += 118.0;
 
-        // Right side: master meter, engine info, file controls (laid out right to left).
+        // Right side: master meter and engine info (laid out right to left).
         let mut rx = full.right() - 12.0;
         let m = Rect::from_min_max(pos2(rx - 14.0, cy - 15.0), pos2(rx, cy + 15.0));
         meter(&p, m, self.view.master_meter);
@@ -85,30 +90,61 @@ impl App {
         let info_w = ui.fonts(|f| f.layout_no_wrap(info.clone(), font(10.0), t.text).size().x);
         caption(&p, pos2(rx, cy), Align2::RIGHT_CENTER, &info, 10.0, t.text_faint);
         rx -= info_w + 16.0;
-        let b = Rect::from_min_size(pos2(rx - 50.0, cy - 10.0), vec2(50.0, 20.0));
-        if button(ui, b, "open", "OPEN", None).on_hover_text("Load the project from the path").clicked() {
-            self.load_project();
-        }
-        rx -= 56.0;
-        let b = Rect::from_min_size(pos2(rx - 50.0, cy - 10.0), vec2(50.0, 20.0));
-        if button(ui, b, "save", "SAVE", None).on_hover_text("Save the project (Ctrl+S)").clicked() {
-            self.save_project();
-        }
-        rx -= 58.0;
-        let path_w = (rx - x - 8.0).clamp(80.0, 320.0);
-        ui.put(
-            Rect::from_min_size(pos2(rx - path_w, cy - 11.0), vec2(path_w, 22.0)),
-            egui::TextEdit::singleline(&mut self.path_text).font(font(11.0)),
-        );
         if let Some(status) = self.status() {
-            let s = status.to_owned();
-            let left = x;
-            let avail = rx - path_w - left - 12.0;
+            let avail = rx - x - 12.0;
             if avail > 60.0 {
-                let txt = widgets::fit_text(ui, &s, 10.5, avail);
-                caption(&p, pos2(left, cy), Align2::LEFT_CENTER, &txt, 10.5, t.mute);
+                let txt = widgets::fit_text(ui, status, 10.5, avail);
+                caption(&p, pos2(x, cy), Align2::LEFT_CENTER, &txt, 10.5, t.mute);
             }
         }
+    }
+
+    /// Global scene launch grid (saved in the user settings).
+    fn launch_quantize_menu(&mut self, ui: &mut egui::Ui, p: &egui::Painter, x: f32, cy: f32) {
+        let t = th();
+        caption(p, pos2(x, cy), Align2::LEFT_CENTER, "SYNC", 10.0, t.text_dim);
+        let current = self.settings.launch_quantize;
+        let label = LAUNCH_QUANTIZE
+            .iter()
+            .find(|(_, q)| (*q - current).abs() < 1e-9)
+            .map_or("?", |(l, _)| l);
+        let mut chosen = current;
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos2(x + 34.0, cy - 11.0), vec2(76.0, 22.0))));
+        egui::ComboBox::from_id_salt("launch_q")
+            .width(70.0)
+            .selected_text(label)
+            .show_ui(&mut child, |ui| {
+                for (l, q) in LAUNCH_QUANTIZE {
+                    ui.selectable_value(&mut chosen, q, l);
+                }
+            })
+            .response
+            .on_hover_text("Scene launch sync: a launched scene starts on the next step of this grid");
+        if chosen != current {
+            self.settings.launch_quantize = chosen;
+            self.settings.save();
+            self.engine.send(Command::SetLaunchQuantize(chosen));
+        }
+    }
+
+    /// GUI scale menu. Ctrl +/-/0 do the same from the keyboard.
+    fn scale_button(&mut self, ui: &mut egui::Ui, x: f32, cy: f32) {
+        let b = Rect::from_min_size(pos2(x, cy - 10.0), vec2(58.0, 20.0));
+        let zoom = ui.ctx().zoom_factor();
+        let resp = button(ui, b, "ui_scale", &format!("{:.0} %", zoom * 100.0), None)
+            .on_hover_text("GUI scale (Ctrl + / Ctrl - / Ctrl 0)");
+        let id = ui.make_persistent_id("scale_popup");
+        if resp.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(id));
+        }
+        egui::popup_below_widget(ui, id, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+            ui.set_min_width(90.0);
+            for s in UI_SCALES {
+                if ui.selectable_label((zoom - s).abs() < 1e-3, format!("{:.0} %", s * 100.0)).clicked() {
+                    ui.ctx().set_zoom_factor(s);
+                }
+            }
+        });
     }
 }
 

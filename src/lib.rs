@@ -6,5 +6,6 @@ pub mod devices;
 pub mod engine;
 pub mod midi;
 pub mod model;
+pub mod settings;
 pub mod theme;
 pub mod ui;

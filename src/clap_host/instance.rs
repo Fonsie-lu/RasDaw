@@ -273,6 +273,7 @@ impl PluginInstance {
             return true;
         }
         audio.events.clear();
+        audio.out_events.clear();
         while let Ok((id, value)) = audio.param_rx.pop() {
             audio.events.param(0, id, value);
         }
@@ -332,6 +333,25 @@ impl PluginInstance {
             }
             _ => false,
         }
+    }
+
+    /// Replaces `notes` and `midi` with what the plugin emitted in the last `process` call
+    /// (note-effect plugins). Audio thread only.
+    pub fn take_output_notes(&self, notes: &mut Vec<NoteEvent>, midi: &mut Vec<[u8; 3]>) {
+        let audio = unsafe { &mut **self.audio.get() };
+        notes.clear();
+        midi.clear();
+        for n in &audio.out_events.notes {
+            if notes.len() < notes.capacity() {
+                notes.push(*n);
+            }
+        }
+        for m in &audio.out_events.midi {
+            if midi.len() < midi.capacity() {
+                midi.push(*m);
+            }
+        }
+        crate::engine::sequencer::sort_events(notes);
     }
 
     // ---------------------------------------------------------------- main thread

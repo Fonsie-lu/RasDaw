@@ -22,12 +22,34 @@ impl Note {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub const KEY_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+/// Time signatures offered in the UI.
+pub const TIME_SIGNATURES: [(u8, u8); 7] = [(2, 4), (3, 4), (4, 4), (5, 4), (6, 8), (7, 8), (12, 8)];
+
+fn default_time_sig() -> (u8, u8) {
+    (4, 4)
+}
+
+/// A scene clip: loops while it plays.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
-    /// Loop length in beats. Only used for scene clips; the arrangement uses the project length.
+    /// Loop length in beats (quarter notes).
     pub length: f64,
     /// Kept sorted by start time (see [`Clip::sort`]).
     pub notes: Vec<Note>,
+    /// Root key, 0 = C .. 11 = B.
+    #[serde(default)]
+    pub root: u8,
+    /// Numerator and denominator.
+    #[serde(default = "default_time_sig")]
+    pub time_sig: (u8, u8),
+}
+
+impl Default for Clip {
+    fn default() -> Self {
+        Self::new(BEATS_PER_BAR)
+    }
 }
 
 impl Clip {
@@ -35,7 +57,20 @@ impl Clip {
         Self {
             length,
             notes: Vec::new(),
+            root: 0,
+            time_sig: default_time_sig(),
         }
+    }
+
+    /// Length of one bar in beats (quarter notes) for this clip's time signature.
+    pub fn bar_beats(&self) -> f64 {
+        let (num, den) = self.time_sig;
+        num.max(1) as f64 * 4.0 / den.max(1) as f64
+    }
+
+    /// "C · 4/4"
+    pub fn key_sig_label(&self) -> String {
+        format!("{} · {}/{}", KEY_NAMES[self.root as usize % 12], self.time_sig.0, self.time_sig.1)
     }
 
     pub fn sort(&mut self) {
@@ -64,6 +99,42 @@ pub struct DeviceSpec {
     /// Parameter values of a built-in device (`plugin_id` starts with `rasdaw.`), by key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<std::collections::BTreeMap<String, f32>>,
+    /// Rack section. Missing in older projects; then derived from the plugin's features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<Section>,
+}
+
+/// Which part of the device rack a device sits in. The chain runs in this order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Section {
+    /// One note-altering device (CLAP `note-effect`).
+    NoteFx,
+    /// One instrument.
+    Instrument,
+    /// Any number of audio effects.
+    Effect,
+}
+
+impl Section {
+    pub fn single(self) -> bool {
+        self != Section::Effect
+    }
+}
+
+/// A block on a track's timeline: plays the track's clip in scene slot `scene`, looping, from
+/// `start` for `length` beats.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Block {
+    pub start: f64,
+    pub length: f64,
+    pub scene: usize,
+}
+
+impl Block {
+    pub fn end(&self) -> f64 {
+        self.start + self.length
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -71,12 +142,18 @@ pub struct Track {
     pub id: u64,
     pub name: String,
     pub color: usize,
-    /// Notes on the timeline. If this has any notes, the track plays the arrangement and its
+    /// Scene blocks on the timeline. If there are any, the track plays them and its launcher
     /// scenes are muted.
-    pub arrangement: Clip,
+    #[serde(default)]
+    pub blocks: Vec<Block>,
     pub scenes: [Option<Clip>; SCENES],
-    /// Scene that loops while the arrangement is empty.
+    /// Scene playing in the launcher, mirrored from the engine every frame (not saved: a
+    /// project always opens with the launcher stopped).
+    #[serde(skip)]
     pub active_scene: Option<usize>,
+    /// Scene waiting for the launch grid, mirrored from the engine.
+    #[serde(skip)]
+    pub queued_scene: Option<usize>,
     pub volume: f32,
     pub pan: f32,
     pub mute: bool,
@@ -98,9 +175,10 @@ impl Track {
             id,
             name,
             color,
-            arrangement: Clip::new(0.0),
+            blocks: Vec::new(),
             scenes: Default::default(),
             active_scene: None,
+            queued_scene: None,
             volume: 0.8,
             pan: 0.0,
             mute: false,
@@ -110,19 +188,51 @@ impl Track {
     }
 
     pub fn has_arrangement(&self) -> bool {
-        !self.arrangement.notes.is_empty()
+        !self.blocks.is_empty()
     }
 
-    /// The core routing rule: notes on the timeline win, otherwise the active scene loops.
-    pub fn play_mode(&self) -> PlayMode {
-        if self.has_arrangement() {
+    /// Index of the block playing at beat `pos`.
+    pub fn block_at(&self, pos: f64) -> Option<usize> {
+        self.blocks.iter().position(|b| pos >= b.start && pos < b.end())
+    }
+
+    pub fn sort_blocks(&mut self) {
+        self.blocks.sort_by(|a, b| a.start.total_cmp(&b.start));
+    }
+
+    /// The core routing rule: while the arranger plays, a track with blocks plays its blocks
+    /// (its scene is muted); otherwise its launched scene loops. Scenes play independently of
+    /// the arranger.
+    pub fn play_mode(&self, arranger_playing: bool) -> PlayMode {
+        if arranger_playing && self.has_arrangement() {
             return PlayMode::Arrangement;
         }
         match self.active_scene {
-            Some(i) if self.scenes[i].as_ref().is_some_and(|c| !c.notes.is_empty()) => {
-                PlayMode::Scene(i)
-            }
+            Some(i) if self.scenes[i].is_some() => PlayMode::Scene(i),
             _ => PlayMode::Silent,
+        }
+    }
+}
+
+/// Rack key and device owner id of the master track (no real track has this id).
+pub const MASTER_ID: u64 = u64::MAX;
+
+/// The master track: the sum of all tracks runs through its effects. It has no scenes and no
+/// timeline blocks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Master {
+    pub volume: f32,
+    pub pan: f32,
+    #[serde(default)]
+    pub devices: Vec<DeviceSpec>,
+}
+
+impl Default for Master {
+    fn default() -> Self {
+        Self {
+            volume: 0.8,
+            pan: 0.0,
+            devices: Vec::new(),
         }
     }
 }
@@ -134,6 +244,8 @@ pub struct Project {
     pub bars: u32,
     pub loop_enabled: bool,
     pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub master: Master,
     pub next_id: u64,
 }
 
@@ -144,6 +256,7 @@ impl Default for Project {
             bars: 32,
             loop_enabled: true,
             tracks: Vec::new(),
+            master: Master::default(),
             next_id: 1,
         }
     }
@@ -189,6 +302,7 @@ impl Project {
         for (i, k) in [60u8, 65, 68, 72, 70, 67, 63, 62].iter().enumerate() {
             arp2.notes.push(n(i as f64, 0.9, *k));
         }
+        arp2.root = 5;
         p.tracks[0].scenes[1] = Some(arp2);
         // Bass: 2 bars
         let mut bass = Clip::new(8.0);
@@ -206,9 +320,6 @@ impl Project {
         }
         pad.sort();
         p.tracks[2].scenes[0] = Some(pad);
-        p.tracks[0].active_scene = Some(0);
-        p.tracks[1].active_scene = Some(0);
-        p.tracks[2].active_scene = Some(0);
         p
     }
 
@@ -226,20 +337,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arrangement_notes_mute_the_scene() {
+    fn timeline_blocks_mute_the_scene_while_the_arranger_plays() {
         let mut p = Project::demo();
-        assert_eq!(p.tracks[0].play_mode(), PlayMode::Scene(0));
-        p.tracks[0].arrangement.notes.push(Note {
-            start: 0.0,
-            len: 1.0,
-            key: 60,
-            velocity: 1.0,
-        });
-        assert_eq!(p.tracks[0].play_mode(), PlayMode::Arrangement);
-        // Empty or missing scene clips play nothing.
-        assert_eq!(p.tracks[3].play_mode(), PlayMode::Silent);
+        p.tracks[0].active_scene = Some(0);
+        assert_eq!(p.tracks[0].play_mode(true), PlayMode::Scene(0));
+        p.tracks[0].blocks.push(Block { start: 0.0, length: 8.0, scene: 1 });
+        assert_eq!(p.tracks[0].play_mode(true), PlayMode::Arrangement);
+        // With the arranger stopped the launched scene plays.
+        assert_eq!(p.tracks[0].play_mode(false), PlayMode::Scene(0));
+        // Missing scene clips play nothing.
+        assert_eq!(p.tracks[3].play_mode(false), PlayMode::Silent);
         p.tracks[3].active_scene = Some(2);
-        assert_eq!(p.tracks[3].play_mode(), PlayMode::Silent);
+        assert_eq!(p.tracks[3].play_mode(false), PlayMode::Silent);
     }
 
     #[test]
@@ -251,6 +360,7 @@ mod tests {
             bypass: true,
             state: Some(vec![1, 2, 3]),
             params: None,
+            section: None,
         });
         p.tracks[1].devices.push(DeviceSpec {
             plugin_id: "rasdaw.delay".into(),
@@ -258,8 +368,24 @@ mod tests {
             bypass: false,
             state: None,
             params: Some([("mix".to_owned(), 0.5)].into_iter().collect()),
+            section: Some(Section::Effect),
         });
+        p.tracks[1].blocks.push(Block { start: 4.0, length: 8.0, scene: 0 });
+        p.tracks[1].scenes[0].as_mut().unwrap().time_sig = (6, 8);
         let back = Project::from_json(&p.to_json()).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn old_projects_still_load() {
+        // Pre-blocks format: `arrangement` field, clips without key/time signature.
+        let json = r#"{"bpm":120.0,"bars":8,"loop_enabled":true,"next_id":2,"tracks":[{"id":1,"name":"T","color":0,
+            "arrangement":{"length":0.0,"notes":[]},"scenes":[{"length":4.0,"notes":[]},null,null,null],
+            "active_scene":0,"volume":0.8,"pan":0.0,"mute":false,"solo":false,"devices":[]}]}"#;
+        let p = Project::from_json(json).unwrap();
+        assert!(p.tracks[0].blocks.is_empty());
+        let clip = p.tracks[0].scenes[0].as_ref().unwrap();
+        assert_eq!((clip.root, clip.time_sig), (0, (4, 4)));
+        assert_eq!(clip.bar_beats(), 4.0);
     }
 }

@@ -1,8 +1,9 @@
 # RasDaw (Fonsie Audio): project notes for Claude
 
 RasDaw by Fonsie Audio: a Bitwig-inspired DAW framework in Rust that hosts **CLAP** plugins.
-It bundles six basic effect devices (EQ-5, Compressor, Limiter, Distortion, Delay, Reverb) that
-live inside the DAW, not as separate plugins. It ships no instruments. The GUI style follows `~/tools/juno-clone` (coloured section bars, raised
+It bundles basic devices that live inside the DAW, not as separate plugins: six audio effects
+(EQ-5, Compressor, Limiter, Distortion, Delay, Reverb) and three note effects (Chord, Arp,
+Note Repeat). It ships no instruments. The GUI style follows `~/tools/juno-clone` (coloured section bars, raised
 buttons, fader caps, ribbed knobs) with a Tokyo Night colour scheme.
 
 ## Commands
@@ -18,8 +19,8 @@ cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one pl
 - Environment:
   - `DAW_AUDIO=pulse|alsa|null` forces a driver.
   - `DAW_ALSA_DEVICE` picks the ALSA device.
-  - `DAW_VIEW=piano:<track>[:<scene>]` or `DAW_VIEW=browser` opens that view at start
-    (for screenshots).
+  - `DAW_VIEW=piano:<track>[:<scene>]`, `rack:<track>`, `browser`, `save`, `launch:<scene>`
+    or `record:<track>:<scene>` sets up that state at start (for screenshots).
   - `DAW_TEST_PLUGIN=<clap id>` picks the instrument for `tests/clap_host.rs`.
 - Screenshots: run the app with `env -u WAYLAND_DISPLAY` (forces X11), then
   `import -window "RasDaw" out.png`. Plugin editor windows are titled `<plugin> — <track>`.
@@ -42,6 +43,7 @@ cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one pl
 | `src/devices/dsp.rs` | Biquad (RBJ cookbook) with `magnitude()`, `DelayLine`, dB helpers |
 | `src/devices/eq.rs` | EQ-5 plus fixed 20 Hz HP / 16 kHz LP (Butterworth 4th order) and mono below 100 Hz (LR4 high-pass on the side signal); `response_db()` for the graph |
 | `src/devices/dynamics.rs` | Compressor (soft knee, stereo linked) and look-ahead limiter (1.5 ms) |
+| `src/devices/notes.rs` | Note FX: `NoteDsp` trait, `NoteCtx`, `Clock` (tempo grid: song position while playing, internal clock while stopped), Chord, Arp, NoteRepeat + tests |
 | `src/devices/fx.rs` | Delay (sync, ping-pong, filtered feedback), Reverb (Freeverb topology + pre-delay + low cut), Distortion (soft/hard/fold/tube) |
 | `src/midi.rs` | MIDI keyboard input: ALSA sequencer via dlopen, own thread, hot-plug auto-connect of hardware ports, `MidiInput` (UI handle: port list, connect/disconnect) |
 | `src/clap_host/scan.rs` | Search path, `PluginLibrary` (dlopen + `clap_entry`), `PluginDesc`, `Registry` |
@@ -52,9 +54,11 @@ cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one pl
 | `src/theme.rs` | `Theme` tokens, `TOKYO_NIGHT`. Never hard-code colours elsewhere |
 | `src/ui/mod.rs` | `App` (eframe), layout constants, device add/remove/move, save/load, snapshot publishing, shortcuts |
 | `src/ui/launcher.rs` | Scene launcher (top left), shared row scrolling |
-| `src/ui/arranger.rs` | Track headers + timeline (top right), `mini_notes()` |
+| `src/ui/arranger.rs` | Track headers + timeline of scene blocks (add, move, resize, drop from launcher), `mini_notes()` |
 | `src/ui/piano_roll.rs` | Piano roll for timeline notes or a scene clip |
-| `src/ui/rack.rs` | Channel strip, CLAP device cards (paged knobs), shared card header, device browser |
+| `src/ui/dialogs.rs` | Save / open modal (Ctrl+S / Ctrl+O) |
+| `src/settings.rs` | User settings (GUI scale) in `~/.config/rasdaw/settings.json` |
+| `src/ui/rack.rs` | Channel strip, three rack sections, `device_frame` (title bar interactions), CLAP cards (paged knobs), drag and drop, device browser per section |
 | `src/ui/builtin_card.rs` | Built-in device cards: all knobs at once, EQ graph with draggable band handles, gain reduction meter |
 | `src/ui/widgets.rs` | Juno-style drawing helpers, fonts, egui visuals |
 | `assets/icons/` | App icon: `rasdaw.svg` (source), PNGs 48–256 for the launcher, `rasdaw-64.rgba` (raw RGBA, window icon via `include_bytes!`). Regenerate with `magick -background none -density 384 rasdaw.svg -resize NxN rasdaw-N.png` and `magick rasdaw-64.png -depth 8 rgba:rasdaw-64.rgba` |
@@ -69,12 +73,70 @@ cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one pl
 
 ## Core rules
 
-- **Scene vs. timeline:** a track whose timeline (arrangement clip) has any notes plays the
-  timeline and its scenes are muted. Otherwise its active scene clip loops. Scene loops are
-  aligned to beat 0 of the timeline (`position mod clip length`). See `Track::play_mode()`.
-- Scenes only sound while the transport runs. Launching a scene or a slot starts it.
+- **Scene vs. timeline:** the timeline holds only per-track scene blocks (`Track::blocks`:
+  start, length, scene slot). A track with blocks plays them and its launcher scenes are muted;
+  otherwise its active scene clip loops, aligned to beat 0 (`position mod clip length`). See
+  `Track::play_mode()`. `engine::block_notes` expands blocks into timeline notes (each block
+  loops its clip, notes are cut at the block end).
+- Clips carry `root` (0..11) and `time_sig`; blocks display only `Clip::key_sig_label()`.
+  The time signature sets the clip's bar length (`bar_beats`) for the piano roll grid and
+  length steps. The global timeline ruler and the CLAP transport stay 4/4.
+- Older projects (with the removed `arrangement` field) load; the field is ignored.
+- **Launcher vs. arranger:** scenes run on the engine's own launcher clock, independent of
+  the arranger transport (Space / play only drive the arranger). The engine owns the launcher
+  state per track (`TrackRt::scene`, `scene_start`, `queued`); the UI sends
+  `Command::LaunchScene` / `StopScenes` (via `App::launch`, which publishes a pending
+  snapshot first) and mirrors `Shared::scene_playing/scene_queued/scene_beat` into
+  `Track::active_scene/queued_scene` every frame (not saved in projects).
+- A launch waits for the next point of the launch grid (`Settings::launch_quantize`, global,
+  default 1/16, the SYNC menu in the top bar; the engine gets it via
+  `Command::SetLaunchQuantize`). The switch happens sample-accurately inside the block; the
+  scene then loops from its start until stopped or replaced.
+- While the arranger plays, a track with timeline blocks plays them and its scene is muted
+  (still running). `TrackSnap` carries the block notes and all 4 scene clips; the engine
+  releases notes when what a track renders changes (`TrackRt::last_mode`).
+- Slots blink while playing (flash on every beat of the scene) and while queued (fast).
+- **Recording:** the ● in a slot's title bar arms it (`App::toggle_record`): creates the clip
+  if needed, launches the scene, selects the track (MIDI target) and sets
+  `Shared::set_record_track`. The engine reports that track's live notes as `RecEvent`s
+  (beats since the scene started); `App::process_recorded` writes them into the clip
+  (`recorded_note_span`: an empty clip grows and is trimmed to whole bars when recording
+  stops, otherwise overdub wraps into the loop). Stopping the scene or clicking ● again ends
+  recording.
 - Rows of the launcher and the arranger share `ROW_H` and `View::scroll_y`, so they line up.
-- Double-click a lane, a track header or a scene slot to open the piano roll; ESC returns.
+- Double-click a block, a track header or a scene slot to open the piano roll; ESC returns.
+- The top bar has no file controls: Ctrl+S / Ctrl+O open a modal dialog (`ui/dialogs.rs`).
+- Never write a file in a script as `open(p,'w').write(open(p).read())`: opening for writing
+  empties the file before it is read (this once wiped `engine/mod.rs`).
+- GUI scale is egui's zoom factor (Ctrl +/-/0 built in, plus the % menu); `settings.rs` stores
+  it in `~/.config/rasdaw/settings.json`. Lay out everything in points so it scales.
+- **Device rack:** fixed height (`RACK_H`), sections NOTE FX (1), INSTRUMENT (1), EFFECTS (n).
+  - `DeviceSpec::section`; `App::normalize_sections` derives it for older projects from the
+    plugin features and keeps `Track::devices` sorted by section (that is the chain order).
+    `section_range()` gives a section's indices.
+  - Adding to a single-slot section replaces its device.
+  - Cards have only a title bar: ✕ at the left = delete, click = bypass toggle, drag =
+    reorder (effects only), right-click = editor / remove. No button row, no footer.
+  - Note FX cards: `Unit::Choice` with 3-15 entries → dropdown, 2 entries → `flip_switch`;
+    everything else is a knob (audio effects keep knobs for choices).
+- **Master track:** `Project::master` (volume, pan, devices), rack key and device owner id
+  `MASTER_ID` (u64::MAX). The device functions (`section_range`, `insert_device`,
+  `add_device`, `add_builtin`, `remove_device`, `move_device`, `device_uid`) take an owner
+  id (track id or `MASTER_ID`); `chain_specs(_mut)` returns its device list. The master has
+  only effects. `Snapshot::master` runs on the summed mix before `master_gain`; device
+  lifecycle checks use `all_devices()` (tracks + master). UI: a `MASTER_H` row below the
+  tracks (no slots, no blocks); `View::master_selected` switches the rack to the master.
+- **Selection / Del:** `View::selection` (`Selection::Device { track, uid }` or
+  `Selection::Block { track, block }`, the block by value, or `Selection::Scene { track,
+  scene }` from clicking a slot; `App::delete_scene` stops it, ends its recording and closes
+  its piano roll). A press on a device card or a
+  click on a block selects it; Del removes the selected piano roll note first, otherwise the
+  selection (`App::delete_selection`). Blocks also have a ✕ at their left.
+- egui gotcha: `ui.put` inside a layout (the rack's horizontal row) moves the layout cursor
+  and shifts everything after it. Use `ui.new_child(UiBuilder::new().max_rect(r))` there.
+  - Note FX: the engine replaces the note events for the rest of the chain with what the
+    note device emitted (built-in: `process_notes`; CLAP: `PluginInstance::take_output_notes`,
+    not yet tested with a real CLAP note-effect plugin since none is installed).
 - **MIDI keyboard:**
   - The selected track receives MIDI input (green MIDI badge on its header).
   - Note on/off become CLAP note events. Other channel messages (CC, pitch bend, pressure,
@@ -97,8 +159,16 @@ cargo run --example editor_smoke -- ch.fonsie.alpha-juno 4   # open/close one pl
 - They have no editor window; everything is set in the rack card.
 - Parameters are atomics (UI writes, audio thread reads once per block). The DSP state and all
   buffers are allocated in `BuiltinDevice::new` on the main thread.
-- To add a device: a `Kind` variant (id, name, description, params, `make_dsp`), a `Dsp`
-  impl, and optionally `rows()`, `param_active()` or a display in `builtin_card.rs`.
+- `BuiltinDevice` holds a `Processor`: `Audio(Box<dyn Dsp>)` or `Notes(Box<dyn NoteDsp>)`.
+  `Kind::section()` puts note kinds into NOTE FX. In the engine a note device's
+  `process_notes` output replaces the block's note events for the rest of the chain (swapped
+  with `Engine::note_scratch`); its audio `process` returns false so audio passes through.
+- Note devices keep note-offs for later blocks as sample countdowns (robust to transport
+  jumps) and never allocate. Arp and Note Repeat fire their first note at the key press,
+  then follow the grid.
+- To add a device: a `Kind` variant (id, name, description, params, `make_processor`), a
+  `Dsp` or `NoteDsp` impl, and optionally `rows()`, `param_active()` or a display in
+  `builtin_card.rs`.
 - The audio thread sets FTZ/DAZ (`audio::enable_flush_to_zero`) against denormal slowdowns.
 
 ## Real-time and threading rules

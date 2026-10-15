@@ -113,10 +113,15 @@ impl PluginDesc {
         self.features.iter().any(|f| f == "instrument")
     }
 
+    /// Note-altering plugin (arpeggiator, chord generator, ...).
+    pub fn is_note_effect(&self) -> bool {
+        !self.is_instrument() && self.features.iter().any(|f| f == "note-effect")
+    }
+
     pub fn is_effect(&self) -> bool {
         self.features
             .iter()
-            .any(|f| f == "audio-effect" || f == "note-effect" || f == "analyzer")
+            .any(|f| f == "audio-effect" || f == "analyzer")
     }
 }
 

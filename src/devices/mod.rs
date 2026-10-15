@@ -9,6 +9,7 @@ pub mod dsp;
 mod dynamics;
 pub mod eq;
 mod fx;
+pub mod notes;
 
 use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
@@ -59,6 +60,12 @@ impl ParamDef {
             log: false,
             unit: Unit::Choice(labels),
         }
+    }
+
+    /// Linear knob travel even for time units (for ranges starting at 0).
+    pub const fn linear(mut self) -> Self {
+        self.log = false;
+        self
     }
 
     pub fn clamp(&self, v: f32) -> f32 {
@@ -125,10 +132,36 @@ pub enum Kind {
     Delay,
     Reverb,
     Distortion,
+    Chord,
+    Arp,
+    NoteRepeat,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] = [Kind::Eq5, Kind::Compressor, Kind::Limiter, Kind::Distortion, Kind::Delay, Kind::Reverb];
+    pub const ALL: [Kind; 9] = [
+        Kind::Eq5,
+        Kind::Compressor,
+        Kind::Limiter,
+        Kind::Distortion,
+        Kind::Delay,
+        Kind::Reverb,
+        Kind::Chord,
+        Kind::Arp,
+        Kind::NoteRepeat,
+    ];
+
+    /// Note-altering device (rack section NOTE FX) rather than an audio effect.
+    pub fn is_note(self) -> bool {
+        matches!(self, Kind::Chord | Kind::Arp | Kind::NoteRepeat)
+    }
+
+    pub fn section(self) -> crate::model::Section {
+        if self.is_note() {
+            crate::model::Section::NoteFx
+        } else {
+            crate::model::Section::Effect
+        }
+    }
 
     /// Plugin id stored in `DeviceSpec::plugin_id`. Never change.
     pub fn id(self) -> &'static str {
@@ -139,6 +172,9 @@ impl Kind {
             Kind::Delay => "rasdaw.delay",
             Kind::Reverb => "rasdaw.reverb",
             Kind::Distortion => "rasdaw.distortion",
+            Kind::Chord => "rasdaw.chord",
+            Kind::Arp => "rasdaw.arp",
+            Kind::NoteRepeat => "rasdaw.note-repeat",
         }
     }
 
@@ -150,6 +186,9 @@ impl Kind {
             Kind::Delay => "Delay",
             Kind::Reverb => "Reverb",
             Kind::Distortion => "Distortion",
+            Kind::Chord => "Chord",
+            Kind::Arp => "Arp",
+            Kind::NoteRepeat => "Note Repeat",
         }
     }
 
@@ -161,6 +200,9 @@ impl Kind {
             Kind::Delay => "Stereo / ping-pong delay with tempo sync",
             Kind::Reverb => "Algorithmic room reverb",
             Kind::Distortion => "Waveshaping distortion",
+            Kind::Chord => "Plays a chord for every note, with inversion, octave and strum",
+            Kind::Arp => "Arpeggiator synced to the song tempo",
+            Kind::NoteRepeat => "Retriggers held notes on the tempo grid",
         }
     }
 
@@ -176,6 +218,9 @@ impl Kind {
             Kind::Delay => fx::DELAY_PARAMS,
             Kind::Reverb => fx::REVERB_PARAMS,
             Kind::Distortion => fx::DISTORTION_PARAMS,
+            Kind::Chord => notes::CHORD_PARAMS,
+            Kind::Arp => notes::ARP_PARAMS,
+            Kind::NoteRepeat => notes::REPEAT_PARAMS,
         }
     }
 
@@ -202,16 +247,24 @@ impl Kind {
         matches!(self, Kind::Compressor | Kind::Limiter)
     }
 
-    fn make_dsp(self, sr: f32) -> Box<dyn Dsp> {
+    fn make_processor(self, sr: f32) -> Processor {
         match self {
-            Kind::Eq5 => Box::new(eq::Eq5::new()),
-            Kind::Compressor => Box::new(dynamics::Compressor::new()),
-            Kind::Limiter => Box::new(dynamics::Limiter::new(sr)),
-            Kind::Delay => Box::new(fx::Delay::new(sr)),
-            Kind::Reverb => Box::new(fx::Reverb::new(sr)),
-            Kind::Distortion => Box::new(fx::Distortion::new()),
+            Kind::Eq5 => Processor::Audio(Box::new(eq::Eq5::new())),
+            Kind::Compressor => Processor::Audio(Box::new(dynamics::Compressor::new())),
+            Kind::Limiter => Processor::Audio(Box::new(dynamics::Limiter::new(sr))),
+            Kind::Delay => Processor::Audio(Box::new(fx::Delay::new(sr))),
+            Kind::Reverb => Processor::Audio(Box::new(fx::Reverb::new(sr))),
+            Kind::Distortion => Processor::Audio(Box::new(fx::Distortion::new())),
+            Kind::Chord => Processor::Notes(Box::<notes::Chord>::default()),
+            Kind::Arp => Processor::Notes(Box::<notes::Arp>::default()),
+            Kind::NoteRepeat => Processor::Notes(Box::<notes::NoteRepeat>::default()),
         }
     }
+}
+
+enum Processor {
+    Audio(Box<dyn Dsp>),
+    Notes(Box<dyn notes::NoteDsp>),
 }
 
 pub struct BuiltinDevice {
@@ -221,7 +274,7 @@ pub struct BuiltinDevice {
     values: Vec<AtomicU32>,
     /// Largest gain reduction of the last block, in dB (f32 bits).
     gain_reduction: AtomicU32,
-    dsp: UnsafeCell<Box<dyn Dsp>>,
+    dsp: UnsafeCell<Processor>,
 }
 
 // `dsp` is only used by the audio thread (see the module docs).
@@ -237,7 +290,7 @@ impl BuiltinDevice {
             sample_rate,
             values: params.iter().map(|p| AtomicU32::new(p.default.to_bits())).collect(),
             gain_reduction: AtomicU32::new(0),
-            dsp: UnsafeCell::new(kind.make_dsp(sample_rate)),
+            dsp: UnsafeCell::new(kind.make_processor(sample_rate)),
         })
     }
 
@@ -283,12 +336,21 @@ impl BuiltinDevice {
         }
     }
 
-    /// Processes `n` frames from `input` into `output`. Audio thread only.
-    pub fn process(&self, input: [&[f32]; 2], output: [&mut [f32]; 2], n: usize, bpm: f64) {
+    fn param_snapshot(&self) -> [f32; MAX_PARAMS] {
         let mut p = [0f32; MAX_PARAMS];
         for (i, v) in self.values.iter().enumerate() {
             p[i] = f32::from_bits(v.load(Ordering::Relaxed));
         }
+        p
+    }
+
+    /// Processes `n` frames from `input` into `output`. Returns false for note devices, which
+    /// leave the audio alone. Audio thread only.
+    pub fn process(&self, input: [&[f32]; 2], output: [&mut [f32]; 2], n: usize, bpm: f64) -> bool {
+        let Processor::Audio(dsp) = (unsafe { &mut *self.dsp.get() }) else {
+            return false;
+        };
+        let p = self.param_snapshot();
         let [l, r] = output;
         l[..n].copy_from_slice(&input[0][..n]);
         r[..n].copy_from_slice(&input[1][..n]);
@@ -296,9 +358,23 @@ impl BuiltinDevice {
             sample_rate: self.sample_rate,
             bpm: bpm as f32,
         };
-        let dsp = unsafe { &mut *self.dsp.get() };
         let gr = dsp.process(&p[..self.values.len()], &mut l[..n], &mut r[..n], &ctx);
         self.gain_reduction.store(gr.to_bits(), Ordering::Relaxed);
+        true
+    }
+
+    /// Note devices: writes the device's output for the `input` events into `out` (cleared
+    /// first, sorted on return). Audio devices copy the input. Audio thread only.
+    pub fn process_notes(&self, input: &[crate::engine::NoteEvent], out: &mut Vec<crate::engine::NoteEvent>, ctx: &notes::NoteCtx) {
+        out.clear();
+        match unsafe { &mut *self.dsp.get() } {
+            Processor::Notes(dsp) => {
+                let p = self.param_snapshot();
+                dsp.process(&p[..self.values.len()], input, out, ctx);
+                crate::engine::sequencer::sort_events(out);
+            }
+            Processor::Audio(_) => out.extend_from_slice(&input[..input.len().min(out.capacity())]),
+        }
     }
 }
 
@@ -355,7 +431,7 @@ mod tests {
             let x = ((k as u32).wrapping_mul(2654435761) >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
             (x, -x * 0.5)
         };
-        for kind in Kind::ALL {
+        for kind in Kind::ALL.into_iter().filter(|k| !k.is_note()) {
             let (l, r) = run(kind, |_| {}, noise, 48_000);
             assert!(l.iter().chain(&r).all(|v| v.is_finite()), "{}", kind.name());
             assert!(peak(&l[24_000..]) > 0.01, "{} is silent", kind.name());
@@ -437,7 +513,7 @@ mod bench {
     fn report_cpu_cost() {
         let n = 48_000;
         let input: Vec<f32> = (0..n).map(|k| (k as f32 * 0.01).sin() * 0.5).collect();
-        for kind in Kind::ALL {
+        for kind in Kind::ALL.into_iter().filter(|k| !k.is_note()) {
             let dev = BuiltinDevice::new(kind, 48_000.0);
             let (mut l, mut r) = (vec![0.0; 256], vec![0.0; 256]);
             let start = std::time::Instant::now();

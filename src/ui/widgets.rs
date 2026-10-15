@@ -24,6 +24,13 @@ pub fn with_alpha(c: Color32, a: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, (a.clamp(0.0, 1.0) * 255.0) as u8)
 }
 
+/// Linear mix of two colours (alpha included).
+pub fn mix_colors(a: Color32, b: Color32, t: f32) -> Color32 {
+    let (a, b) = (a.to_srgba_unmultiplied(), b.to_srgba_unmultiplied());
+    let l = |i: usize| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t.clamp(0.0, 1.0)).round() as u8;
+    Color32::from_rgba_unmultiplied(l(0), l(1), l(2), l(3))
+}
+
 /// Panel body with the bevel line along its top edge.
 pub fn panel(p: &Painter, rect: Rect) {
     let t = th();
@@ -77,6 +84,22 @@ pub fn paint_button(p: &Painter, rect: Rect, label: &str, lit: Option<Color32>, 
     let text = if lit.is_some() { t.bar_text } else { t.text };
     let size = if rect.height() < 18.0 { 10.0 } else { 11.5 };
     p.text(rect.center(), Align2::CENTER_CENTER, label, font(size), text);
+}
+
+/// On/off flip switch: a pill with a sliding knob, filled with `accent` when on.
+pub fn flip_switch(ui: &mut Ui, rect: Rect, id: impl std::hash::Hash, on: bool, accent: Color32) -> Response {
+    let t = th();
+    let resp = ui.interact(rect, Id::new(("switch", id)), Sense::click());
+    let p = ui.painter();
+    let radius = rect.height() * 0.5;
+    let track = if on { accent } else { t.slot };
+    p.rect_filled(rect.translate(vec2(0.0, 1.5)), r(radius), Color32::from_black_alpha(120));
+    p.rect_filled(rect, r(radius), track);
+    p.rect_stroke(rect, r(radius), Stroke::new(1.0_f32, t.bevel), StrokeKind::Inside);
+    let x = if on { rect.right() - radius } else { rect.left() + radius };
+    let c = pos2(x, rect.center().y);
+    p.circle_filled(c, radius - 2.5, if resp.hovered() { t.text } else { t.knob_cap });
+    resp
 }
 
 /// Stereo peak meter, bottom-up, with the usual green/yellow/red zones.

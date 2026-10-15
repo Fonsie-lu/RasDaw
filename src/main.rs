@@ -45,6 +45,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             ui::widgets::setup_style(&cc.egui_ctx);
+            cc.egui_ctx.set_zoom_factor(rasdaw::settings::Settings::load().ui_scale);
             Ok(Box::new(ui::App::new(handle, stream, driver, registry, path)))
         }),
     )

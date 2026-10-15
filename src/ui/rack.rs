@@ -1,29 +1,59 @@
-//! Device rack (bottom): the selected track's channel strip, then its devices (CLAP plugins
-//! and built-in devices) left to right in signal order, then the "+" card that opens the
-//! device browser. Built-in devices are drawn by `builtin_card.rs`.
+//! Device rack (bottom, fixed height): the selected track's channel strip, then three
+//! sections in signal order:
+//! - NOTE FX: one note-altering device,
+//! - INSTRUMENT: one instrument,
+//! - EFFECTS: any number of audio effects (CLAP or built-in).
+//!
+//! Cards have only a title bar: the cross at its left deletes the device, a click toggles it
+//! on/off, dragging (effects) reorders, right-click opens the editor and removal menu. A click
+//! anywhere on a card selects it; Del deletes the selected device. Built-in device bodies are drawn by
+//! `builtin_card.rs`.
 
 use super::widgets::{self, button, caption, fader, knob, meter, section_bar, with_alpha};
-use super::App;
+use super::{App, DeviceDrag};
 use crate::clap_host::PluginInstance;
 use crate::devices::Kind;
 use crate::engine::{volume_gain, DeviceRef};
+use crate::model::{DeviceSpec, Section, MASTER_ID};
 use crate::theme::current as th;
-use eframe::egui::{self, pos2, vec2, Align2, Id, Rect, Sense, Stroke};
+use eframe::egui::{self, pos2, vec2, Align2, Id, LayerId, Order, Rect, Sense, Stroke};
 use std::sync::Arc;
 
 const STRIP_W: f32 = 168.0;
 pub(super) const CARD_W: f32 = 304.0;
-const PLUS_W: f32 = 110.0;
+const EMPTY_W: f32 = 128.0;
+const PLUS_W: f32 = 84.0;
+const GAP: f32 = 10.0;
+const GROUP_GAP: f32 = 22.0;
+const LABEL_H: f32 = 16.0;
+pub(super) const TITLE_H: f32 = 22.0;
+/// Top of the card body, relative to the card.
+pub(super) const BODY_TOP: f32 = 4.0 + TITLE_H + 6.0;
 const COLS: usize = 4;
 /// Height a knob cell needs: knob, name and value lines.
 pub(super) const CELL_H: f32 = 64.0;
 
+const SECTIONS: [(Section, &str); 3] = [
+    (Section::NoteFx, "NOTE FX"),
+    (Section::Instrument, "INSTRUMENT"),
+    (Section::Effect, "EFFECTS"),
+];
+
 pub(super) enum RackAction {
     Bypass(usize),
     Editor(usize),
-    Move(usize, usize),
     Remove(usize),
     Page(u64, usize),
+    Browse(Section),
+    StartDrag(usize, egui::Vec2),
+    Select(u64),
+}
+
+fn card_width(dev: Option<&DeviceRef>, h: f32) -> f32 {
+    match dev {
+        Some(DeviceRef::Builtin(d)) => super::builtin_card::width(d.kind, h),
+        _ => CARD_W,
+    }
 }
 
 impl App {
@@ -33,19 +63,34 @@ impl App {
         let p = ui.painter().clone();
         p.rect_filled(full, widgets::r(0.0), t.bg_dark);
         p.line_segment([full.left_top(), full.right_top()], Stroke::new(1.0_f32, t.bevel));
-        if self.project.tracks.is_empty() {
-            caption(&p, full.center(), Align2::CENTER_CENTER, "No tracks. Add one with + TRACK.", 13.0, t.text_dim);
-            return;
+        // Claim the whole panel so it keeps its fixed size.
+        ui.allocate_rect(full, Sense::hover());
+        let master = self.view.master_selected || self.project.tracks.is_empty();
+        if !master {
+            self.view.selected_track = self.view.selected_track.min(self.project.tracks.len() - 1);
         }
-        let ti = self.view.selected_track.min(self.project.tracks.len() - 1);
-        self.view.selected_track = ti;
-
         let area = full.shrink2(vec2(8.0, 8.0));
         let strip = Rect::from_min_size(area.min, vec2(STRIP_W, area.height()));
-        self.channel_strip(ui, strip, ti);
+        // `track_id` is the device chain owner: a track id or MASTER_ID.
+        let track_id = if master {
+            self.master_strip(ui, strip);
+            MASTER_ID
+        } else {
+            let ti = self.view.selected_track;
+            self.channel_strip(ui, strip, ti);
+            self.project.tracks[ti].id
+        };
 
-        let devices = Rect::from_min_max(pos2(strip.right() + 10.0, area.top()), area.max);
+        let devices = Rect::from_min_max(pos2(strip.right() + 12.0, area.top()), area.max);
         let mut actions = Vec::new();
+        let mut effect_cards: Vec<(usize, Rect)> = Vec::new();
+        let chain = self.rack.get(&track_id).cloned().unwrap_or_default();
+        let specs = self.chain_specs(track_id).to_vec();
+        // The master holds only effects.
+        let sections: Vec<(Section, &str)> = SECTIONS.iter().copied().filter(|(s, _)| !master || *s == Section::Effect).collect();
+        let ranges: Vec<_> = sections.iter().map(|(s, _)| self.section_range(track_id, *s)).collect();
+        let effects = self.section_range(track_id, Section::Effect);
+
         ui.scope_builder(egui::UiBuilder::new().max_rect(devices), |ui| {
             egui::ScrollArea::horizontal()
                 .id_salt("rack_scroll")
@@ -53,62 +98,161 @@ impl App {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
-                        let h = devices.height() - 14.0;
-                        let track = &self.project.tracks[ti];
-                        let chain = self.rack.get(&track.id).cloned().unwrap_or_default();
-                        for (di, (spec, dev)) in track.devices.iter().zip(&chain).enumerate() {
-                            let n = track.devices.len();
-                            let w = match dev {
-                                Some(DeviceRef::Builtin(d)) => super::builtin_card::width(d.kind, h),
-                                _ => CARD_W,
+                        let h = devices.height() - 12.0;
+                        let card_h = h - LABEL_H;
+                        for (gi, ((section, label), range)) in sections.iter().zip(&ranges).enumerate() {
+                            let widths: Vec<f32> = range.clone().map(|di| card_width(chain[di].as_ref(), card_h)).collect();
+                            let extra = if section.single() {
+                                if range.is_empty() { EMPTY_W } else { 0.0 }
+                            } else {
+                                PLUS_W + if range.is_empty() { 0.0 } else { GAP }
                             };
-                            let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
-                            match dev {
-                                Some(DeviceRef::Builtin(d)) => self.builtin_card(ui, rect, di, n, spec, d, &mut actions),
-                                Some(DeviceRef::Clap(inst)) => self.device_card(ui, rect, di, n, spec, Some(inst), &mut actions),
-                                None => self.device_card(ui, rect, di, n, spec, None, &mut actions),
+                            let group_w = widths.iter().sum::<f32>() + GAP * widths.len().saturating_sub(1) as f32 + extra;
+                            let (group, _) = ui.allocate_exact_size(vec2(group_w, h), Sense::hover());
+                            caption(ui.painter(), group.left_top() + vec2(2.0, 0.0), Align2::LEFT_TOP, label, 10.0, t.text_faint);
+                            let mut x = group.left();
+                            let top = group.top() + LABEL_H;
+                            for (di, w) in range.clone().zip(widths) {
+                                let rect = Rect::from_min_size(pos2(x, top), vec2(w, card_h));
+                                self.device_card(ui, rect, di, &specs[di], chain[di].as_ref(), &mut actions);
+                                if *section == Section::Effect {
+                                    effect_cards.push((di, rect));
+                                }
+                                x += w + GAP;
                             }
-                            let (gap, _) = ui.allocate_exact_size(vec2(18.0, h), Sense::hover());
-                            caption(ui.painter(), gap.center(), Align2::CENTER_CENTER, "›", 18.0, t.text_faint);
-                        }
-                        let (rect, _) = ui.allocate_exact_size(vec2(PLUS_W, h), Sense::hover());
-                        let resp = ui.interact(rect, Id::new("add_device"), Sense::click());
-                        let pp = ui.painter();
-                        let col = if resp.hovered() { t.accent } else { t.text_faint };
-                        pp.rect_filled(rect, widgets::r(4.0), if resp.hovered() { t.bg_card } else { t.bg_panel });
-                        pp.rect_stroke(rect, widgets::r(4.0), Stroke::new(1.0_f32, with_alpha(col, 0.6)), egui::StrokeKind::Inside);
-                        caption(pp, rect.center() - vec2(0.0, 10.0), Align2::CENTER_CENTER, "+", 34.0, col);
-                        caption(pp, rect.center() + vec2(0.0, 22.0), Align2::CENTER_CENTER, "ADD DEVICE", 11.0, col);
-                        if resp.clicked() {
-                            self.view.browser_open = !self.view.browser_open;
+                            if extra > 0.0 {
+                                let w = if section.single() { EMPTY_W } else { PLUS_W };
+                                let rect = Rect::from_min_size(pos2(group.right() - w, top), vec2(w, card_h));
+                                let text = match section {
+                                    Section::NoteFx => "NOTE FX",
+                                    Section::Instrument => "INSTRUMENT",
+                                    Section::Effect => "EFFECT",
+                                };
+                                if add_card(ui, rect, ("add", gi), text) {
+                                    actions.push(RackAction::Browse(*section));
+                                }
+                            }
+                            if gi + 1 < sections.len() {
+                                let (gap, _) = ui.allocate_exact_size(vec2(GROUP_GAP, h), Sense::hover());
+                                caption(ui.painter(), gap.center() + vec2(0.0, LABEL_H * 0.5), Align2::CENTER_CENTER, "›", 18.0, t.text_faint);
+                            }
                         }
                     });
+                    self.device_drop(ui, track_id, &effects, &effect_cards, &specs);
                 });
         });
 
-        // Claim the whole panel, or egui shrinks the resizable panel to the used area.
-        ui.allocate_rect(full, Sense::hover());
-
         for a in actions {
-            let track_name = self.project.tracks[ti].name.clone();
-            let id = self.project.tracks[ti].id;
+            let track_name = if master { "Master".to_owned() } else { self.project.tracks[self.view.selected_track].name.clone() };
             match a {
                 RackAction::Bypass(i) => {
-                    let d = &mut self.project.tracks[ti].devices[i];
-                    d.bypass = !d.bypass;
+                    if let Some(d) = self.chain_specs_mut(track_id).and_then(|d| d.get_mut(i)) {
+                        d.bypass = !d.bypass;
+                    }
                     self.dirty = true;
                 }
                 RackAction::Editor(i) => {
-                    if let Some(Some(DeviceRef::Clap(inst))) = self.rack.get(&id).and_then(|c| c.get(i)).cloned() {
+                    if let Some(Some(DeviceRef::Clap(inst))) = self.rack.get(&track_id).and_then(|c| c.get(i)).cloned() {
                         self.toggle_editor(&inst, &track_name);
                     }
                 }
-                RackAction::Move(from, to) => self.move_device(ti, from, to),
-                RackAction::Remove(i) => self.remove_device(ti, i),
+                RackAction::Remove(i) => self.remove_device(track_id, i),
                 RackAction::Page(uid, page) => {
                     self.view.param_page.insert(uid, page);
                 }
+                RackAction::Browse(section) => {
+                    self.view.browser_section = section;
+                    self.view.browser_open = true;
+                }
+                RackAction::StartDrag(from, grab) => {
+                    self.view.device_drag = Some(DeviceDrag { track: track_id, from, grab });
+                }
+                RackAction::Select(uid) => {
+                    self.view.selection = Some(super::Selection::Device { track: track_id, uid });
+                }
             }
+        }
+    }
+
+    /// While an effect card is dragged: ghost title under the pointer and an insertion
+    /// marker; on release, move the device there.
+    fn device_drop(&mut self, ui: &mut egui::Ui, owner: u64, effects: &std::ops::Range<usize>, cards: &[(usize, Rect)], specs: &[DeviceSpec]) {
+        let Some(drag) = self.view.device_drag else {
+            return;
+        };
+        if drag.track != owner || !effects.contains(&drag.from) {
+            self.view.device_drag = None;
+            return;
+        }
+        let t = th();
+        let (down, pointer) = ui.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos()));
+        let Some(pp) = pointer else {
+            return;
+        };
+        // Insertion slot: number of cards whose centre is left of the pointer.
+        let slot = cards.iter().filter(|(_, r)| r.center().x < pp.x).count();
+        let marker_x = match cards.get(slot) {
+            Some((_, r)) => r.left() - GAP * 0.5,
+            None => cards.last().map_or(pp.x, |(_, r)| r.right() + GAP * 0.5),
+        };
+        if let Some((_, r)) = cards.first() {
+            let p = ui.painter();
+            p.line_segment([pos2(marker_x, r.top()), pos2(marker_x, r.bottom())], Stroke::new(3.0_f32, t.accent));
+        }
+        let fp = ui.ctx().layer_painter(LayerId::new(Order::Tooltip, Id::new("device_ghost")));
+        let ghost = Rect::from_min_size(pp - drag.grab, vec2(CARD_W.min(220.0), TITLE_H));
+        fp.rect_filled(ghost.translate(vec2(0.0, 3.0)), widgets::r(3.0), egui::Color32::from_black_alpha(120));
+        section_bar(&fp, ghost, &specs[drag.from].name.to_uppercase(), with_alpha(t.device_bars[1], 0.85));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if !down {
+            let from_local = drag.from - effects.start;
+            let to_local = if slot > from_local { slot - 1 } else { slot };
+            if to_local != from_local {
+                self.move_device(owner, drag.from, effects.start + to_local);
+            }
+            self.view.device_drag = None;
+        }
+    }
+
+    /// Device chain shown in the rack: the selected track's, or the master's.
+    pub(super) fn rack_owner(&self) -> u64 {
+        match self.project.tracks.get(self.view.selected_track) {
+            Some(t) if !self.view.master_selected => t.id,
+            _ => MASTER_ID,
+        }
+    }
+
+    /// Master strip: volume and pan of the sum, master meter.
+    fn master_strip(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let t = th();
+        let p = ui.painter().clone();
+        p.rect_filled(rect, widgets::r(4.0), t.bg_panel);
+        let bar = Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(rect.width() - 8.0, 20.0));
+        section_bar(&p, bar, "MASTER", t.text);
+        let m = &self.project.master;
+        let (vol0, pan0) = (m.volume, m.pan);
+        let body_top = bar.bottom() + 8.0;
+        let fr = Rect::from_min_max(pos2(rect.left() + 14.0, body_top), pos2(rect.left() + 54.0, rect.bottom() - 22.0));
+        let (_, new_vol) = fader(ui, fr, "master_vol", vol0, 0.8, t.text);
+        let vol = new_vol.unwrap_or(vol0);
+        let db = 20.0 * volume_gain(vol).max(1e-6).log10();
+        let db_text = if db < -60.0 { "-∞ dB".to_owned() } else { format!("{db:+.1} dB") };
+        caption(&p, pos2(fr.center().x + 4.0, rect.bottom() - 10.0), Align2::CENTER_CENTER, &db_text, 9.5, t.text_dim);
+        let kc = pos2(rect.left() + 100.0, body_top + 26.0);
+        let (_, new_pan) = knob(ui, kc, 16.0, "master_pan", (pan0 + 1.0) * 0.5, 0.5, t.text);
+        let pan = new_pan.map(|v| v * 2.0 - 1.0).unwrap_or(pan0);
+        caption(&p, kc + vec2(0.0, 26.0), Align2::CENTER_CENTER, "PAN", 9.5, t.text_dim);
+        let pan_text = match (pan * 50.0).round() as i32 {
+            0 => "C".to_owned(),
+            v if v < 0 => format!("L{}", -v),
+            v => format!("R{v}"),
+        };
+        caption(&p, kc + vec2(0.0, 38.0), Align2::CENTER_CENTER, &pan_text, 9.5, t.text);
+        meter(&p, Rect::from_min_max(pos2(rect.right() - 20.0, body_top), pos2(rect.right() - 9.0, rect.bottom() - 10.0)), self.view.master_meter);
+        if new_vol.is_some() || new_pan.is_some() {
+            self.project.master.volume = vol;
+            self.project.master.pan = pan;
+            self.dirty = true;
         }
     }
 
@@ -160,30 +304,93 @@ impl App {
         }
     }
 
+
+    /// Card frame shared by all devices: body and title bar. Click the title to toggle
+    /// on/off, drag it to reorder (effects), right-click for the editor and removal.
+    /// `glyph_w` reserves room at the right end of the title for extra controls.
     #[allow(clippy::too_many_arguments)]
-    fn device_card(
+    pub(super) fn device_frame(
         &self,
         ui: &mut egui::Ui,
         rect: Rect,
         di: usize,
-        count: usize,
-        spec: &crate::model::DeviceSpec,
-        inst: Option<&Arc<PluginInstance>>,
+        uid: u64,
+        spec: &DeviceSpec,
+        color: egui::Color32,
+        has_editor: bool,
+        glyph_w: f32,
         actions: &mut Vec<RackAction>,
-    ) {
+    ) -> Rect {
         let t = th();
         let p = ui.painter().clone();
-        let Some(inst) = inst else {
-            card_body(&p, rect);
-            let bar = Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(rect.width() - 8.0, 20.0));
-            section_bar(&p, bar, &format!("MISSING · {}", spec.name.to_uppercase()), t.record);
-            caption(&p, rect.center(), Align2::CENTER_CENTER, &spec.plugin_id, 11.0, t.text_dim);
-            let b = Rect::from_min_size(pos2(rect.right() - 30.0, bar.bottom() + 6.0), vec2(24.0, 18.0));
-            if button(ui, b, ("rm", di, &spec.plugin_id), "✕", None).clicked() {
-                actions.push(RackAction::Remove(di));
+        let dragging = self.view.device_drag.is_some_and(|d| d.from == di);
+        p.rect_filled(rect.translate(vec2(0.0, 3.0)), widgets::r(4.0), egui::Color32::from_black_alpha(120));
+        p.rect_filled(rect, widgets::r(4.0), if dragging { t.bg_dark } else { t.bg_panel });
+        p.line_segment([rect.left_top() + vec2(4.0, 0.0), rect.right_top() - vec2(4.0, 0.0)], Stroke::new(1.0_f32, t.bevel));
+        // Any press inside the card selects it (Del removes the selection).
+        let pressed_here = ui.input(|i| i.pointer.any_pressed() && i.pointer.press_origin().is_some_and(|o| rect.contains(o)));
+        if pressed_here {
+            actions.push(RackAction::Select(uid));
+        }
+        if self.view.selection == Some(super::Selection::Device { track: self.rack_owner(), uid }) {
+            widgets::outline(&p, rect.expand(2.0), t.accent, 2.0);
+        }
+        let bar = Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(rect.width() - 8.0, TITLE_H));
+        // Delete cross at the left end of the title bar.
+        let cross = Rect::from_min_size(bar.min, vec2(24.0, TITLE_H));
+        let title = Rect::from_min_max(pos2(cross.right(), bar.top()), pos2(bar.right() - glyph_w, bar.bottom()));
+        let effect = spec.section == Some(Section::Effect);
+        let sense = if effect { Sense::click_and_drag() } else { Sense::click() };
+        let resp = ui.interact(title, Id::new(("dev_title", uid)), sense);
+        let bar_col = if spec.bypass { t.text_faint } else { color };
+        let bar_col = if resp.hovered() { widgets::with_alpha(bar_col, 0.85) } else { bar_col };
+        p.rect_filled(bar, widgets::r(3.0), bar_col);
+        let name = widgets::fit_text(ui, &spec.name.to_uppercase(), 13.0, title.width() - 12.0);
+        caption(&p, title.center(), Align2::CENTER_CENTER, &name, 13.0, t.bar_text);
+        if glyph(ui, cross, ("del", uid), "✕", false).on_hover_text("Delete device (Del)").clicked() {
+            actions.push(RackAction::Remove(di));
+        }
+        if resp.clicked() {
+            actions.push(RackAction::Bypass(di));
+        }
+        if resp.drag_started() {
+            let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(title.min);
+            actions.push(RackAction::StartDrag(di, origin - bar.min));
+        }
+        let hint = if spec.bypass { "off — click to turn on" } else { "on — click to turn off" };
+        let resp = resp.on_hover_text(format!("{}: {hint}{}", spec.name, if effect { ", drag to move" } else { "" }));
+        resp.context_menu(|ui| {
+            if has_editor && ui.button("Open editor").clicked() {
+                actions.push(RackAction::Editor(di));
+                ui.close_menu();
             }
-            return;
-        };
+            if ui.button(if spec.bypass { "Turn on" } else { "Turn off" }).clicked() {
+                actions.push(RackAction::Bypass(di));
+                ui.close_menu();
+            }
+            if ui.button("Remove").clicked() {
+                actions.push(RackAction::Remove(di));
+                ui.close_menu();
+            }
+        });
+        Rect::from_min_max(pos2(rect.left(), rect.top() + BODY_TOP), rect.max)
+    }
+
+    fn device_card(&self, ui: &mut egui::Ui, rect: Rect, di: usize, spec: &DeviceSpec, dev: Option<&DeviceRef>, actions: &mut Vec<RackAction>) {
+        let t = th();
+        match dev {
+            Some(DeviceRef::Builtin(d)) => self.builtin_card(ui, rect, di, spec, d, actions),
+            Some(DeviceRef::Clap(inst)) => self.clap_card(ui, rect, di, spec, inst, actions),
+            None => {
+                let body = self.device_frame(ui, rect, di, missing_uid(spec, di), spec, t.record, false, 0.0, actions);
+                caption(ui.painter(), body.center() - vec2(0.0, 10.0), Align2::CENTER_CENTER, "NOT INSTALLED", 12.0, t.record);
+                caption(ui.painter(), body.center() + vec2(0.0, 10.0), Align2::CENTER_CENTER, &spec.plugin_id, 10.0, t.text_dim);
+            }
+        }
+    }
+
+    fn clap_card(&self, ui: &mut egui::Ui, rect: Rect, di: usize, spec: &DeviceSpec, inst: &Arc<PluginInstance>, actions: &mut Vec<RackAction>) {
+        let t = th();
         let kind = if inst.desc.is_instrument() {
             0
         } else if inst.desc.is_effect() {
@@ -191,40 +398,52 @@ impl App {
         } else {
             2
         };
+        let accent = t.device_bars[kind];
         let uid = inst.uid;
-        let by = card_header(ui, rect, di, count, uid, spec, t.device_bars[kind], actions);
-        let x = rect.left() + 46.0;
-        if inst.has_gui() {
-            let b = Rect::from_min_size(pos2(x, by), vec2(44.0, 18.0));
-            let open = self.editor_open(uid);
-            if button(ui, b, ("edit", uid), "EDIT", open.then_some(t.accent))
-                .on_hover_text("Open the plugin's own editor")
-                .clicked()
-            {
-                actions.push(RackAction::Editor(di));
-            }
-        }
-
-        // Parameter knobs, one page at a time; as many rows as the rack height allows.
         let params = inst.params();
-        let grid_top = by + 26.0;
-        let grid_bottom = rect.bottom() - 22.0;
-        let rows = (((grid_bottom - grid_top) / CELL_H).floor() as usize).clamp(1, 4);
+        let body_h = rect.height() - BODY_TOP - 6.0;
+        let rows = ((body_h / CELL_H).floor() as usize).clamp(1, 4);
         let page_size = COLS * rows;
         let pages = params.len().div_ceil(page_size).max(1);
         let page = self.view.param_page.get(&uid).copied().unwrap_or(0).min(pages - 1);
+
+        // Title glyphs (right to left): editor window, page arrows.
+        let glyph_w = if inst.has_gui() { 26.0 } else { 0.0 } + if pages > 1 { 70.0 } else { 0.0 };
+        let body = self.device_frame(ui, rect, di, uid, spec, accent, inst.has_gui(), glyph_w, actions);
+        let bar = Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(rect.width() - 8.0, TITLE_H));
+        let mut gx = bar.right();
+        if inst.has_gui() {
+            let r = Rect::from_min_max(pos2(gx - 26.0, bar.top()), pos2(gx, bar.bottom()));
+            let open = self.editor_open(uid);
+            if glyph(ui, r, ("ed", uid), "", open).on_hover_text("Plugin editor").clicked() {
+                actions.push(RackAction::Editor(di));
+            }
+            gx -= 26.0;
+        }
+        if pages > 1 {
+            let r = Rect::from_min_max(pos2(gx - 18.0, bar.top()), pos2(gx, bar.bottom()));
+            if glyph(ui, r, ("pg+", uid), "›", false).clicked() && page + 1 < pages {
+                actions.push(RackAction::Page(uid, page + 1));
+            }
+            caption(ui.painter(), pos2(gx - 35.0, bar.center().y), Align2::CENTER_CENTER, &format!("{}/{}", page + 1, pages), 10.0, t.bar_text);
+            let r = Rect::from_min_max(pos2(gx - 70.0, bar.top()), pos2(gx - 52.0, bar.bottom()));
+            if glyph(ui, r, ("pg-", uid), "‹", false).clicked() && page > 0 {
+                actions.push(RackAction::Page(uid, page - 1));
+            }
+        }
+
+        let p = ui.painter().clone();
         let cell_w = (rect.width() - 12.0) / COLS as f32;
-        let cell_h = (grid_bottom - grid_top) / rows as f32;
-        let accent = t.device_bars[kind];
+        let cell_h = (body.height() - 6.0) / rows as f32;
         if params.is_empty() {
-            caption(&p, pos2(rect.center().x, (grid_top + grid_bottom) * 0.5), Align2::CENTER_CENTER, "no parameters", 11.0, t.text_faint);
+            caption(&p, body.center(), Align2::CENTER_CENTER, "no parameters", 11.0, t.text_faint);
         }
         for (slot, info) in params.iter().skip(page * page_size).take(page_size).enumerate() {
             let col = slot % COLS;
             let row = slot / COLS;
             let cx = rect.left() + 6.0 + cell_w * (col as f32 + 0.5);
             let radius = 14.0;
-            let cy = grid_top + cell_h * row as f32 + (cell_h - CELL_H) * 0.5 + radius + 4.0;
+            let cy = body.top() + cell_h * row as f32 + (cell_h - CELL_H).max(0.0) * 0.5 + radius + 4.0;
             let range = (info.max - info.min).max(1e-9);
             let value = inst.param_value(info.id).unwrap_or(info.default);
             let norm = ((value - info.min) / range) as f32;
@@ -245,34 +464,26 @@ impl App {
             caption(&p, pos2(cx, cy + radius + 21.0), Align2::CENTER_CENTER, &vt, 9.0, t.text_dim);
             resp.on_hover_text(format!("{}{}: {text}", if info.module.is_empty() { String::new() } else { format!("{}/", info.module) }, info.name));
         }
-
-        // Footer: vendor and pages
-        let fy = rect.bottom() - 11.0;
-        caption(&p, pos2(rect.left() + 8.0, fy), Align2::LEFT_CENTER, &widgets::fit_text(ui, &inst.desc.vendor, 9.0, 140.0), 9.0, t.text_faint);
-        if pages > 1 {
-            let b = Rect::from_min_size(pos2(rect.right() - 92.0, fy - 8.0), vec2(20.0, 16.0));
-            if button(ui, b, ("pg-", uid), "◀", None).clicked() && page > 0 {
-                actions.push(RackAction::Page(uid, page - 1));
-            }
-            caption(&p, pos2(rect.right() - 50.0, fy), Align2::CENTER_CENTER, &format!("{}/{}", page + 1, pages), 10.0, t.text_dim);
-            let b = Rect::from_min_size(pos2(rect.right() - 28.0, fy - 8.0), vec2(20.0, 16.0));
-            if button(ui, b, ("pg+", uid), "▶", None).clicked() && page + 1 < pages {
-                actions.push(RackAction::Page(uid, page + 1));
-            }
-        }
     }
 
-    /// Plugin browser window. Clicking a plugin adds it to the selected track.
+    /// Device browser for one rack section. Clicking an entry adds it to the selected track.
     pub(super) fn browser_ui(&mut self, ctx: &egui::Context) {
         let t = th();
+        let section = self.view.browser_section;
         let mut open = true;
         let mut chosen: Option<Result<Kind, crate::clap_host::PluginDesc>> = None;
-        egui::Window::new("ADD DEVICE")
+        let title = match section {
+            Section::NoteFx => "ADD NOTE FX",
+            Section::Instrument => "ADD INSTRUMENT",
+            Section::Effect => "ADD EFFECT",
+        };
+        egui::Window::new(title)
+            .id(Id::new("device_browser"))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
             .default_size([360.0, 420.0])
-            .anchor(egui::Align2::LEFT_BOTTOM, [STRIP_W + 30.0, -270.0])
+            .anchor(egui::Align2::LEFT_BOTTOM, [STRIP_W + 30.0, -(super::RACK_H + 10.0)])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Search");
@@ -280,48 +491,52 @@ impl App {
                 });
                 ui.separator();
                 let filter = self.view.browser_filter.to_lowercase();
+                let matches = |name: &str, vendor: &str| filter.is_empty() || name.to_lowercase().contains(&filter) || vendor.to_lowercase().contains(&filter);
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    let builtins: Vec<Kind> = Kind::ALL
-                        .into_iter()
-                        .filter(|k| filter.is_empty() || k.name().to_lowercase().contains(&filter))
-                        .collect();
-                    if !builtins.is_empty() {
-                        ui.colored_label(t.device_bars[3], "RASDAW DEVICES");
-                        for k in builtins {
-                            if ui.selectable_label(false, k.name()).on_hover_text(k.description()).clicked() {
-                                chosen = Some(Ok(k));
-                            }
-                        }
-                        ui.add_space(6.0);
-                    }
-                    type Filter = fn(&crate::clap_host::PluginDesc) -> bool;
-                    let groups: [(&str, Filter, usize); 3] = [
-                        ("INSTRUMENTS", |d| d.is_instrument(), 0),
-                        ("EFFECTS", |d| !d.is_instrument() && d.is_effect(), 1),
-                        ("OTHER", |d| !d.is_instrument() && !d.is_effect(), 2),
-                    ];
-                    for (title, pred, kind) in groups {
-                        let list: Vec<_> = self
-                            .registry
-                            .plugins
-                            .iter()
-                            .filter(|d| pred(d))
-                            .filter(|d| filter.is_empty() || d.name.to_lowercase().contains(&filter) || d.vendor.to_lowercase().contains(&filter))
+                    let mut any = false;
+                    if section != Section::Instrument {
+                        let builtins: Vec<Kind> = Kind::ALL
+                            .into_iter()
+                            .filter(|k| k.section() == section && matches(k.name(), "RasDaw"))
                             .collect();
-                        if list.is_empty() {
-                            continue;
+                        if !builtins.is_empty() {
+                            any = true;
+                            ui.colored_label(t.device_bars[3], "RASDAW DEVICES");
+                            for k in builtins {
+                                if ui.selectable_label(false, k.name()).on_hover_text(k.description()).clicked() {
+                                    chosen = Some(Ok(k));
+                                }
+                            }
+                            ui.add_space(6.0);
                         }
-                        ui.colored_label(t.device_bars[kind], title);
-                        for d in list {
+                    }
+                    let plugins: Vec<_> = self
+                        .registry
+                        .plugins
+                        .iter()
+                        .filter(|d| match section {
+                            Section::NoteFx => d.is_note_effect(),
+                            Section::Instrument => d.is_instrument(),
+                            Section::Effect => !d.is_instrument() && !d.is_note_effect(),
+                        })
+                        .filter(|d| matches(&d.name, &d.vendor))
+                        .collect();
+                    if !plugins.is_empty() {
+                        any = true;
+                        ui.colored_label(t.device_bars[if section == Section::Instrument { 0 } else { 1 }], "CLAP PLUGINS");
+                        for d in plugins {
                             let label = format!("{}   ·  {} {}", d.name, d.vendor, d.version);
                             if ui.selectable_label(false, label).on_hover_text(d.library.path.display().to_string()).clicked() {
                                 chosen = Some(Err(d.clone()));
                             }
                         }
-                        ui.add_space(6.0);
                     }
-                    if self.registry.plugins.is_empty() {
-                        ui.label("No CLAP plugins found.");
+                    if !any {
+                        ui.label(match section {
+                            Section::NoteFx => "Nothing found.",
+                            Section::Instrument => "No instrument plugins installed.",
+                            Section::Effect => "Nothing found.",
+                        });
                     }
                     ui.separator();
                     ui.collapsing("Search paths", |ui| {
@@ -339,10 +554,10 @@ impl App {
                 });
             });
         if let Some(choice) = chosen {
-            let ti = self.view.selected_track;
+            let owner = self.rack_owner();
             match choice {
-                Ok(kind) => self.add_builtin(ti, kind),
-                Err(desc) => self.add_device(ti, &desc),
+                Ok(kind) => self.add_builtin(owner, kind),
+                Err(desc) => self.add_device(owner, &desc, section),
             }
             open = false;
         }
@@ -353,59 +568,42 @@ impl App {
     }
 }
 
-/// Card background with drop shadow and bevel.
-pub(super) fn card_body(p: &egui::Painter, rect: Rect) {
-    let t = th();
-    p.rect_filled(rect.translate(vec2(0.0, 3.0)), widgets::r(4.0), egui::Color32::from_black_alpha(120));
-    p.rect_filled(rect, widgets::r(4.0), t.bg_panel);
-    p.line_segment([rect.left_top() + vec2(4.0, 0.0), rect.right_top() - vec2(4.0, 0.0)], Stroke::new(1.0_f32, t.bevel));
+/// Stand-in uid of a device whose plugin is not installed.
+pub(super) fn missing_uid(spec: &DeviceSpec, di: usize) -> u64 {
+    Id::new(("missing", &spec.plugin_id, di)).value()
 }
 
-/// Card body, title bar and the shared button row (ON, move left/right, remove).
-/// Returns the y of the button row; x from `rect.left() + 46` is free for more buttons.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn card_header(
-    ui: &mut egui::Ui,
-    rect: Rect,
-    di: usize,
-    count: usize,
-    uid: u64,
-    spec: &crate::model::DeviceSpec,
-    color: egui::Color32,
-    actions: &mut Vec<RackAction>,
-) -> f32 {
+/// Small clickable glyph inside a title bar.
+fn glyph(ui: &mut egui::Ui, rect: Rect, id: impl std::hash::Hash, text: &str, lit: bool) -> egui::Response {
     let t = th();
-    let p = ui.painter().clone();
-    card_body(&p, rect);
-    let bar = Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(rect.width() - 8.0, 20.0));
-    let bar_col = if spec.bypass { t.text_faint } else { color };
-    section_bar(&p, bar, &widgets::fit_text(ui, &spec.name.to_uppercase(), 13.0, bar.width() - 10.0), bar_col);
-    let by = bar.bottom() + 6.0;
-    let b = Rect::from_min_size(pos2(rect.left() + 6.0, by), vec2(36.0, 18.0));
-    if button(ui, b, ("on", uid), "ON", (!spec.bypass).then_some(t.play))
-        .on_hover_text("Bypass on/off")
-        .clicked()
-    {
-        actions.push(RackAction::Bypass(di));
+    let resp = ui.interact(rect, Id::new(("glyph", id)), Sense::click());
+    if resp.hovered() || lit {
+        ui.painter().rect_filled(rect.shrink(2.0), widgets::r(2.0), egui::Color32::from_black_alpha(if lit { 90 } else { 50 }));
     }
-    let mut rx = rect.right() - 6.0;
-    let b = Rect::from_min_size(pos2(rx - 24.0, by), vec2(24.0, 18.0));
-    if button(ui, b, ("rm", uid), "✕", None).on_hover_text("Remove device").clicked() {
-        actions.push(RackAction::Remove(di));
+    if text.is_empty() {
+        // Window icon (two overlapping frames); the panel font has no such glyph.
+        let c = rect.center();
+        let st = Stroke::new(1.5_f32, t.bar_text);
+        let back = Rect::from_center_size(c + vec2(2.0, -2.0), vec2(10.0, 8.0));
+        let front = Rect::from_center_size(c + vec2(-2.0, 2.0), vec2(10.0, 8.0));
+        ui.painter().rect_stroke(back, widgets::r(1.0), st, egui::StrokeKind::Middle);
+        ui.painter().rect_filled(front, widgets::r(1.0), egui::Color32::from_black_alpha(0));
+        ui.painter().rect_stroke(front, widgets::r(1.0), st, egui::StrokeKind::Middle);
+    } else {
+        caption(ui.painter(), rect.center(), Align2::CENTER_CENTER, text, 14.0, t.bar_text);
     }
-    rx -= 32.0;
-    if di + 1 < count {
-        let b = Rect::from_min_size(pos2(rx - 24.0, by), vec2(24.0, 18.0));
-        if button(ui, b, ("right", uid), "▶", None).on_hover_text("Move right").clicked() {
-            actions.push(RackAction::Move(di, di + 1));
-        }
-    }
-    rx -= 28.0;
-    if di > 0 {
-        let b = Rect::from_min_size(pos2(rx - 24.0, by), vec2(24.0, 18.0));
-        if button(ui, b, ("left", uid), "◀", None).on_hover_text("Move left").clicked() {
-            actions.push(RackAction::Move(di, di - 1));
-        }
-    }
-    by
+    resp
+}
+
+/// Dashed "+" card for an empty slot or the end of the effect chain.
+fn add_card(ui: &mut egui::Ui, rect: Rect, id: impl std::hash::Hash, label: &str) -> bool {
+    let t = th();
+    let resp = ui.interact(rect, Id::new(id), Sense::click());
+    let p = ui.painter();
+    let col = if resp.hovered() { t.accent } else { t.text_faint };
+    p.rect_filled(rect, widgets::r(4.0), if resp.hovered() { t.bg_card } else { t.bg_panel });
+    p.rect_stroke(rect, widgets::r(4.0), Stroke::new(1.0_f32, with_alpha(col, 0.6)), egui::StrokeKind::Inside);
+    caption(p, rect.center() - vec2(0.0, 10.0), Align2::CENTER_CENTER, "+", 30.0, col);
+    caption(p, rect.center() + vec2(0.0, 20.0), Align2::CENTER_CENTER, label, 10.0, col);
+    resp.clicked()
 }

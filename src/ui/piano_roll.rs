@@ -7,7 +7,7 @@
 use super::widgets::{self, button, caption, panel, section_bar_left, with_alpha};
 use super::{App, EditTarget, NoteDrag, NoteDragMode, BAR_H, HEADER_H};
 use crate::engine::Command;
-use crate::model::{Clip, Note, PlayMode, BEATS_PER_BAR};
+use crate::model::{Clip, Note, PlayMode, KEY_NAMES, TIME_SIGNATURES};
 use crate::theme::current as th;
 use eframe::egui::{self, pos2, vec2, Align2, CursorIcon, Id, Pos2, Rect, Sense, Stroke};
 
@@ -33,31 +33,36 @@ fn sort_keep(clip: &mut Clip, index: usize) -> Option<usize> {
 impl App {
     pub(super) fn piano_roll_ui(&mut self, ui: &mut egui::Ui, rect: Rect, target: EditTarget) {
         let t = th();
-        let ti = self.track_index(target.track_id()).unwrap();
+        let ti = self.track_index(target.track).unwrap();
+        // A copy, so the edits below can borrow `self` mutably.
+        let Some(clip) = self.clip(target).cloned() else {
+            self.view.editor = None;
+            return;
+        };
         let track = &self.project.tracks[ti];
         let color = t.track(track.color);
         let track_name = track.name.clone();
         let track_id = track.id;
-        let clip_len = match target {
-            EditTarget::Arrangement(_) => self.project.length_beats(),
-            EditTarget::Scene(_, s) => track.scenes[s].as_ref().map_or(BEATS_PER_BAR, |c| c.length),
-        };
+        let clip_len = clip.length;
+        let bar_len = clip.bar_beats();
         // Where the playhead sits inside this clip, if it is the one playing.
         let pos = self.engine.shared.position();
-        let playhead = match (target, track.play_mode()) {
-            (EditTarget::Arrangement(_), PlayMode::Arrangement) => Some(pos),
-            (EditTarget::Scene(_, s), PlayMode::Scene(a)) if s == a => Some(pos.rem_euclid(clip_len)),
+        let arranger = self.engine.shared.playing();
+        let scene_beat = self.engine.shared.scene_beat(ti);
+        let playhead = match track.play_mode(arranger) {
+            PlayMode::Scene(s) if s == target.scene => Some(scene_beat.rem_euclid(clip_len.max(1e-9))),
+            PlayMode::Arrangement => track
+                .block_at(pos)
+                .map(|i| &track.blocks[i])
+                .filter(|b| b.scene == target.scene)
+                .map(|b| (pos - b.start).rem_euclid(clip_len.max(1e-9))),
             _ => None,
         };
 
         let p = ui.painter_at(rect);
         panel(&p, rect);
-        let what = match target {
-            EditTarget::Arrangement(_) => "TIMELINE".to_owned(),
-            EditTarget::Scene(_, s) => format!("SCENE {}", s + 1),
-        };
         let bar = Rect::from_min_max(rect.min + vec2(4.0, 4.0), pos2(rect.right() - 4.0, rect.top() + BAR_H));
-        section_bar_left(&p, bar, &format!("PIANO ROLL · {} · {}", track_name.to_uppercase(), what), color);
+        section_bar_left(&p, bar, &format!("PIANO ROLL · {} · SCENE {}", track_name.to_uppercase(), target.scene + 1), color);
 
         // Controls on the right of the bar (right to left)
         let mut x = bar.right() - 4.0;
@@ -77,25 +82,62 @@ impl App {
             }
             x -= 44.0;
         }
-        if let EditTarget::Scene(_, s) = target {
-            x -= 8.0;
-            let b = Rect::from_min_max(pos2(x - 24.0, by), pos2(x, by + bh));
-            if button(ui, b, "len+", "+", None).on_hover_text("Clip one bar longer").clicked() {
-                if let Some(c) = &mut self.project.tracks[ti].scenes[s] {
-                    c.length = (c.length + BEATS_PER_BAR).min(64.0 * BEATS_PER_BAR);
-                    self.dirty = true;
-                }
+        x -= 8.0;
+        let s = target.scene;
+        let b = Rect::from_min_max(pos2(x - 24.0, by), pos2(x, by + bh));
+        if button(ui, b, "len+", "+", None).on_hover_text("Clip one bar longer").clicked() {
+            if let Some(c) = &mut self.project.tracks[ti].scenes[s] {
+                c.length = (c.length + bar_len).min(256.0);
+                self.dirty = true;
             }
-            x -= 28.0;
-            let b = Rect::from_min_max(pos2(x - 24.0, by), pos2(x, by + bh));
-            if button(ui, b, "len-", "−", None).on_hover_text("Clip one bar shorter").clicked() {
-                if let Some(c) = &mut self.project.tracks[ti].scenes[s] {
-                    c.length = (c.length - BEATS_PER_BAR).max(BEATS_PER_BAR);
-                    self.dirty = true;
-                }
+        }
+        x -= 28.0;
+        let b = Rect::from_min_max(pos2(x - 24.0, by), pos2(x, by + bh));
+        if button(ui, b, "len-", "−", None).on_hover_text("Clip one bar shorter").clicked() {
+            if let Some(c) = &mut self.project.tracks[ti].scenes[s] {
+                c.length = (c.length - bar_len).max(bar_len);
+                self.dirty = true;
             }
-            x -= 28.0;
-            caption(&p, pos2(x, bar.center().y), Align2::RIGHT_CENTER, &format!("LENGTH {} BARS", clip_len / BEATS_PER_BAR), 11.0, t.bar_text);
+        }
+        x -= 30.0;
+        let bars = clip_len / bar_len;
+        let len_text = if bars.fract().abs() < 1e-6 { format!("{bars} BARS") } else { format!("{bars:.2} BARS") };
+        caption(&p, pos2(x, bar.center().y), Align2::RIGHT_CENTER, &len_text, 11.0, t.bar_text);
+        x -= 82.0;
+
+        // Root key and time signature of the scene clip
+        let mut sig = clip.time_sig;
+        let mut root = clip.root;
+        ui.put(Rect::from_min_max(pos2(x - 70.0, by), pos2(x, by + bh)), |ui: &mut egui::Ui| {
+            egui::ComboBox::from_id_salt(("pr_sig", track_id, s))
+                .width(64.0)
+                .selected_text(format!("{}/{}", sig.0, sig.1))
+                .show_ui(ui, |ui| {
+                    for ts in TIME_SIGNATURES {
+                        ui.selectable_value(&mut sig, ts, format!("{}/{}", ts.0, ts.1));
+                    }
+                })
+                .response
+                .on_hover_text("Time signature")
+        });
+        x -= 78.0;
+        ui.put(Rect::from_min_max(pos2(x - 60.0, by), pos2(x, by + bh)), |ui: &mut egui::Ui| {
+            egui::ComboBox::from_id_salt(("pr_root", track_id, s))
+                .width(54.0)
+                .selected_text(KEY_NAMES[root as usize % 12])
+                .show_ui(ui, |ui| {
+                    for (k, name) in KEY_NAMES.iter().enumerate() {
+                        ui.selectable_value(&mut root, k as u8, *name);
+                    }
+                })
+                .response
+                .on_hover_text("Root key")
+        });
+        if sig != clip.time_sig || root != clip.root {
+            if let Some(c) = &mut self.project.tracks[ti].scenes[s] {
+                c.time_sig = sig;
+                c.root = root;
+            }
         }
 
         let header_top = rect.top() + BAR_H + 4.0;
@@ -112,7 +154,7 @@ impl App {
         let key_at = |y: f32| (key_top - (y - grid.top()) / kh).floor().clamp(0.0, 127.0) as u8;
         let b1 = beat_at(grid.right());
 
-        // Rows
+        // Rows; rows of the root key are tinted.
         let gp = ui.painter_at(grid);
         let kp = ui.painter_at(keys);
         let lowest = key_at(grid.bottom());
@@ -121,6 +163,9 @@ impl App {
             let y = y_of(k);
             let row = Rect::from_min_max(pos2(grid.left(), y), pos2(grid.right(), y + kh));
             gp.rect_filled(row, widgets::r(0.0), if is_black(k) { t.row_black } else { t.row_white });
+            if k % 12 == root % 12 {
+                gp.rect_filled(row, widgets::r(0.0), with_alpha(color, 0.09));
+            }
             if k % 12 == 0 {
                 gp.line_segment([row.left_bottom(), row.right_bottom()], Stroke::new(1.0_f32, t.grid_bar));
             }
@@ -130,18 +175,20 @@ impl App {
             let pressed = self.view.pr.preview_key == Some(k) || (midi_target && self.engine.shared.live_key(k));
             let fill = if pressed { color } else if is_black(k) { t.key_black } else { t.key_white };
             kp.rect_filled(key_rect.shrink2(vec2(0.0, 0.5)), widgets::r(1.0), fill);
-            if k % 12 == 0 {
-                caption(&kp, key_rect.right_center() - vec2(4.0, 0.0), Align2::RIGHT_CENTER, &key_name(k), 9.0, t.bar_text);
+            if k % 12 == 0 || k % 12 == root % 12 {
+                let ink = if is_black(k) { t.text } else { t.bar_text };
+                caption(&kp, key_rect.right_center() - vec2(4.0, 0.0), Align2::RIGHT_CENTER, &key_name(k), 9.0, ink);
             }
         }
-        // Verticals: grid steps, beats, bars
-        let step = if zoom * snap >= 8.0 { snap } else if zoom >= 8.0 { 1.0 } else { BEATS_PER_BAR };
+        // Verticals: grid steps, beats, bars (in the clip's time signature)
+        let step = if zoom * snap >= 8.0 { snap } else if zoom >= 8.0 { 1.0 } else { bar_len };
+        let on = |b: f64, unit: f64| ((b / unit) - (b / unit).round()).abs() < 1e-6;
         let mut b = (scroll / step).floor() * step;
         while b < b1 {
             let x = x_of(b);
-            let col = if b % BEATS_PER_BAR == 0.0 {
+            let col = if on(b, bar_len) {
                 t.grid_bar
-            } else if b.fract() == 0.0 {
+            } else if on(b, 1.0) {
                 with_alpha(t.grid_bar, 0.55)
             } else {
                 t.grid_beat
@@ -158,23 +205,19 @@ impl App {
         // Ruler
         let rp = ui.painter_at(ruler);
         rp.rect_filled(ruler, widgets::r(0.0), t.bg_dark);
-        let mut bar_i = (scroll / BEATS_PER_BAR).floor().max(0.0);
-        let label_every = if zoom * BEATS_PER_BAR >= 40.0 { 1.0 } else { 4.0 };
-        while bar_i * BEATS_PER_BAR < b1 {
-            let x = x_of(bar_i * BEATS_PER_BAR);
+        let mut bar_i = (scroll / bar_len).floor().max(0.0);
+        let label_every = if zoom * bar_len >= 40.0 { 1.0 } else { 4.0 };
+        while bar_i * bar_len < b1 {
+            let x = x_of(bar_i * bar_len);
             if bar_i % label_every == 0.0 {
                 rp.line_segment([pos2(x, ruler.top() + 12.0), pos2(x, ruler.bottom())], Stroke::new(1.0_f32, t.text_faint));
                 caption(&rp, pos2(x + 3.0, ruler.top() + 3.0), Align2::LEFT_TOP, &format!("{}", bar_i as i64 + 1), 10.0, t.text_dim);
             }
             bar_i += 1.0;
         }
+        caption(&rp, pos2(ruler.right() - 6.0, ruler.center().y), Align2::RIGHT_CENTER, &clip.key_sig_label(), 10.0, t.text_dim);
 
         // Notes
-        // A copy, so the edits below can borrow `self` mutably.
-        let Some(clip) = self.clip(target).cloned() else {
-            self.view.editor = None;
-            return;
-        };
         let clip = &clip;
         let note_rect = |n: &Note| -> Rect {
             Rect::from_min_max(pos2(x_of(n.start), y_of(n.key) + 1.0), pos2(x_of(n.end()) - 1.0, y_of(n.key) + kh - 1.0))
